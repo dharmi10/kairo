@@ -32,6 +32,9 @@ class DecisionMatrix:
         return self.reason_codes.get(reason)
 
 
+VALID_SOURCES = {"customer", "business", "gateway", "razorpay"}
+
+
 def _validate(raw: dict) -> None:
     missing = REQUIRED_TOP_LEVEL_KEYS - raw.keys()
     if missing:
@@ -41,6 +44,9 @@ def _validate(raw: dict) -> None:
         bucket = play.get("bucket")
         if bucket not in raw["buckets"]:
             raise ValueError(f"reason_code '{reason}' references undefined bucket '{bucket}'")
+        source = play.get("source")
+        if source not in VALID_SOURCES:
+            raise ValueError(f"reason_code '{reason}' has missing/invalid source '{source}'")
 
     override_bucket = raw["congestion_override"].get("reclassify_to")
     if override_bucket not in raw["buckets"]:

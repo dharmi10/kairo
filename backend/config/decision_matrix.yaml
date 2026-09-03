@@ -10,6 +10,27 @@
 #                  behaviour as of 2026-09-03. The bucket/play/limits are
 #                  our own documented assumption, not a confirmed string.
 #                  Do not present these as verified in the pitch.
+#
+# A second verification pass on 2026-09-03 scanned
+# https://razorpay.com/docs/errors/payments/list/ for further codes that
+# map cleanly to our five buckets. Each entry added in that pass cites the
+# same URL inline. A few required a judgment call beyond a pure
+# code-to-bucket lookup -- flagged individually where that applies (see
+# card_declined / debit_declined / payment_declined below, reclassified
+# to ambiguous B3_TRANSIENT on 2026-09-03 -- see inline note there).
+#
+# `source` fields added 2026-09-03 (Phase 2): every entry below now
+# carries a structured `source` (customer | business | gateway | razorpay)
+# alongside the bucket -- previously this was only in comments. The
+# generator (M2) needs it as machine-readable data to populate
+# FailureEvent.error.source; deriving it from a comment string would mean
+# duplicating this matrix's data outside itself, which is exactly what
+# M1's "no decision logic hardcoded elsewhere" principle rules out. Values
+# are taken directly from the verification already recorded in this file's
+# comments, not re-derived. A few codes have a documented split (e.g.
+# `payment_risk_check_failed` is "gateway/business", `authentication_failed`
+# is "customer/gateway") -- the single structured value below is the
+# primary/first-listed source; the comment retains the full nuance.
 
 matrix_version: "2026-09-03"
 
@@ -34,8 +55,25 @@ buckets:
     label: "Unrecognised reason code or low-confidence classification"
 
 reason_codes:
+  # --- B1_CONGESTION -- direct verified mapping (strengthens the USP) ---
+  # Found during the second doc pass: Razorpay publishes a reason code
+  # that names congestion directly. When this exact code is present, the
+  # classifier assigns B1_CONGESTION straight from this lookup -- it does
+  # NOT need the timestamp+history inference in congestion_override below.
+  # That inference heuristic still stands for gateway_technical_error /
+  # payment_failed, where no such explicit code exists.
+  payment_declined_due_to_high_traffic:        # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B1_CONGESTION
+    action: RETRY
+    delay_hours: 1
+    max_attempts: 2
+    snap_to_window: true
+    stop_condition: "2 fails -> reclassify, see congestion_override.reclassify_after_max_attempts"
+
   # --- VERIFIED reason codes -------------------------------------------
   gateway_technical_error:                     # VERIFIED (source: gateway)
+    source: gateway
     bucket: B3_TRANSIENT
     action: RETRY
     delay_hours: 3
@@ -44,6 +82,7 @@ reason_codes:
     stop_condition: "3 consecutive fails in 24h -> escalate to notify"
 
   insufficient_funds:                          # VERIFIED (source: customer)
+    source: customer
     bucket: B2_BALANCE
     action: RETRY_AT_INCOME_WINDOW
     max_attempts: 2
@@ -52,6 +91,7 @@ reason_codes:
     stop_condition: "2 fails across 2 income windows -> pause mandate, request customer action"
 
   payment_timed_out:                           # VERIFIED (source: gateway)
+    source: gateway
     bucket: B3_TRANSIENT
     action: RETRY
     delay_hours: 0        # same day, next safe window
@@ -60,6 +100,7 @@ reason_codes:
     stop_condition: "2 fails -> switch to customer-initiated link"
 
   authorisation_declined_by_psp:                # VERIFIED (source: gateway)
+    source: gateway
     bucket: B3_TRANSIENT
     action: RETRY
     delay_hours: 5         # 4-6 hrs
@@ -67,37 +108,148 @@ reason_codes:
     snap_to_window: true
     stop_condition: "2 fails -> treat as B4_STRUCTURAL, channel fallback"
 
+  # --- Additional verified B3_TRANSIENT codes (added 2026-09-03) --------
+  # All of these are Razorpay's own "technical glitch / temporary
+  # unavailability, please retry" family -- textually the same shape as
+  # gateway_technical_error, so they inherit its play rather than each
+  # getting an invented, unsupported timing number.
+  bank_not_available:                          # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B3_TRANSIENT
+    action: RETRY
+    delay_hours: 3
+    max_attempts: 3
+    snap_to_window: true
+    stop_condition: "3 consecutive fails in 24h -> escalate to notify"
+
+  bank_technical_error:                        # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B3_TRANSIENT
+    action: RETRY
+    delay_hours: 3
+    max_attempts: 3
+    snap_to_window: true
+    stop_condition: "3 consecutive fails in 24h -> escalate to notify"
+
+  bank_cutoff_in_progress:                     # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B3_TRANSIENT
+    action: RETRY
+    delay_hours: 3
+    max_attempts: 3
+    snap_to_window: true
+    stop_condition: "3 consecutive fails in 24h -> escalate to notify"
+
+  issuer_technical_error:                      # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B3_TRANSIENT
+    action: RETRY
+    delay_hours: 3
+    max_attempts: 3
+    snap_to_window: true
+    stop_condition: "3 consecutive fails in 24h -> escalate to notify"
+
+  psp_app_not_available:                       # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B3_TRANSIENT
+    action: RETRY
+    delay_hours: 3
+    max_attempts: 3
+    snap_to_window: true
+    stop_condition: "3 consecutive fails in 24h -> escalate to notify"
+
+  psp_not_available:                           # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B3_TRANSIENT
+    action: RETRY
+    delay_hours: 3
+    max_attempts: 3
+    snap_to_window: true
+    stop_condition: "3 consecutive fails in 24h -> escalate to notify"
+
+  request_timed_out:                           # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B3_TRANSIENT
+    action: RETRY
+    delay_hours: 3
+    max_attempts: 3
+    snap_to_window: true
+    stop_condition: "3 consecutive fails in 24h -> escalate to notify"
+
+  invalid_response_from_gateway:               # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B3_TRANSIENT
+    action: RETRY
+    delay_hours: 3
+    max_attempts: 3
+    snap_to_window: true
+    stop_condition: "3 consecutive fails in 24h -> escalate to notify"
+
+  server_error:                                # VERIFIED (source: razorpay -- their own server, not gateway/customer) -- https://razorpay.com/docs/errors/payments/list/
+    source: razorpay
+    bucket: B3_TRANSIENT
+    action: RETRY
+    delay_hours: 3
+    max_attempts: 3
+    snap_to_window: true
+    stop_condition: "3 consecutive fails in 24h -> escalate to notify"
+
   card_expired:                                 # VERIFIED (source: customer)
+    source: customer
     bucket: B5_DEAD
     action: NUDGE_REAUTH
     max_attempts: 0
     stop_condition: "immediate stop"
 
   debit_instrument_blocked:                     # VERIFIED (source: customer)
+    source: customer
     bucket: B5_DEAD
     action: NUDGE_REAUTH
     max_attempts: 0
     stop_condition: "immediate stop"
 
+  # --- Additional verified B5_DEAD codes (added 2026-09-03) -------------
+  debit_instrument_inactive:                   # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B5_DEAD
+    action: NUDGE_REAUTH
+    max_attempts: 0
+    stop_condition: "immediate stop"
+
+  reqauth_mandate_not_acknowledged:            # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B5_DEAD
+    action: NUDGE_REAUTH
+    max_attempts: 0
+    stop_condition: "immediate stop"
+    # Genuine mandate-lifecycle code, distinct from the mandate_revoked_by_customer
+    # / mandate_expired PLACEHOLDERS below -- this is specifically an
+    # unacknowledged re-authentication request, not a revocation or
+    # expiry. Does not replace those placeholders; kept separate.
+
   payment_risk_check_failed:                    # VERIFIED (source: gateway/business)
+    source: gateway
     bucket: B5_DEAD
     action: ESCALATE_HUMAN
     max_attempts: 0
     stop_condition: "immediate stop + human queue"
 
   payment_cancelled:                            # VERIFIED (source: customer)
+    source: customer
     bucket: B4_STRUCTURAL
     action: NUDGE_REENGAGE
     max_attempts: 1
     stop_condition: "1 nudge, then stop"
 
   authentication_failed:                        # VERIFIED (source: customer/gateway)
+    source: customer
     bucket: B4_STRUCTURAL
     action: NUDGE_CUSTOMER_LINK
     max_attempts: 1
     stop_condition: "1 nudge, then stop"
 
   incorrect_otp:                                # VERIFIED (source: customer)
+    source: customer
     bucket: B4_STRUCTURAL
     action: NUDGE_CUSTOMER_LINK
     max_attempts: 1
@@ -106,12 +258,14 @@ reason_codes:
     # `invalid_otp`. Razorpay's documented string is `incorrect_otp`.
 
   incorrect_cvv:                                # VERIFIED (source: customer)
+    source: customer
     bucket: B4_STRUCTURAL
     action: NUDGE_CUSTOMER_LINK
     max_attempts: 1
     stop_condition: "1 nudge, then stop"
 
   transaction_daily_limit_exceeded:             # VERIFIED (source: gateway)
+    source: gateway
     bucket: B4_STRUCTURAL
     action: RETRY
     delay_hours: 24
@@ -122,6 +276,7 @@ reason_codes:
     # limit breached" placeholder used in the original draft.
 
   payment_failed:                               # VERIFIED (source: gateway) -- generic catch-all
+    source: gateway
     bucket: B3_TRANSIENT
     action: RETRY
     max_attempts: 2
@@ -132,6 +287,114 @@ reason_codes:
     # "no specific error code received from gateway". The classifier
     # handles the probabilistic reclassification after one failed retry.
 
+  # card_declined / debit_declined / payment_declined -- RECLASSIFIED
+  # 2026-09-03 from B5_DEAD to ambiguous B3_TRANSIENT (same treatment as
+  # payment_failed above). Reasoning: these are generic bank-decline
+  # codes that can cover insufficient funds, velocity/risk-rule declines,
+  # or a genuinely dead instrument -- Razorpay's description doesn't say
+  # which. B5_DEAD means "never retried"; misfiling a recoverable failure
+  # there loses that money permanently and silently. Misfiling the other
+  # way costs exactly one wasted, bounded retry attempt before the
+  # classifier reclassifies to B5 anyway. Given real ambiguity, the
+  # asymmetric cost of the two mistakes means the recoverable assumption
+  # is the correct default, not the pessimistic one. (Design note for
+  # M3: the classifier should key this two-stage confidence behaviour off
+  # `ambiguous: true` generically, not off a hardcoded reason-code name --
+  # so any code flagged ambiguous here, not just payment_failed, gets the
+  # same soft-then-reclassify treatment.)
+  card_declined:                               # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B3_TRANSIENT
+    action: RETRY
+    max_attempts: 2
+    snap_to_window: true
+    ambiguous: true
+    stop_condition: "2 fails -> reclassify as B5_DEAD, notify"
+
+  debit_declined:                              # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B3_TRANSIENT
+    action: RETRY
+    max_attempts: 2
+    snap_to_window: true
+    ambiguous: true
+    stop_condition: "2 fails -> reclassify as B5_DEAD, notify"
+
+  payment_declined:                            # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B3_TRANSIENT
+    action: RETRY
+    max_attempts: 2
+    snap_to_window: true
+    ambiguous: true
+    stop_condition: "2 fails -> reclassify as B5_DEAD, notify"
+
+  # --- Additional verified B4_STRUCTURAL codes (added 2026-09-03) -------
+  transaction_limit_exceeded:                  # VERIFIED (source: customer) -- https://razorpay.com/docs/errors/payments/list/
+    source: customer
+    bucket: B4_STRUCTURAL
+    action: NUDGE_CUSTOMER_LINK
+    max_attempts: 0
+    stop_condition: "immediate stop, nudge alternate card/method"
+
+  transaction_daily_count_exceeded:            # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B4_STRUCTURAL
+    action: RETRY
+    delay_hours: 24
+    max_attempts: 1
+    snap_to_window: true
+    stop_condition: "1 fail next day -> channel fallback"
+
+  transaction_frequency_limit_exceeded:        # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B4_STRUCTURAL
+    action: NUDGE_CUSTOMER_LINK
+    max_attempts: 0
+    stop_condition: "immediate stop, nudge alternate method (NPCI-enforced cap, not merchant-side)"
+
+  credit_limit_exceeded:                       # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B4_STRUCTURAL
+    action: NUDGE_CUSTOMER_LINK
+    max_attempts: 0
+    stop_condition: "immediate stop, nudge alternate method"
+
+  otp_attempts_exceeded:                       # VERIFIED (source: customer) -- https://razorpay.com/docs/errors/payments/list/
+    source: customer
+    bucket: B4_STRUCTURAL
+    action: NUDGE_CUSTOMER_LINK
+    max_attempts: 0
+    stop_condition: "immediate stop, customer must reattempt via a fresh checkout link"
+
+  otp_expired:                                 # VERIFIED (source: customer) -- https://razorpay.com/docs/errors/payments/list/
+    source: customer
+    bucket: B4_STRUCTURAL
+    action: NUDGE_CUSTOMER_LINK
+    max_attempts: 0
+    stop_condition: "immediate stop, customer must request a new OTP"
+
+  pin_attempts_exceeded:                       # VERIFIED (source: customer) -- https://razorpay.com/docs/errors/payments/list/
+    source: customer
+    bucket: B4_STRUCTURAL
+    action: NUDGE_CUSTOMER_LINK
+    max_attempts: 0
+    stop_condition: "immediate stop, customer must reattempt via a fresh checkout link"
+
+  transaction_on_vpa_restricted:               # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B4_STRUCTURAL
+    action: NUDGE_CUSTOMER_LINK
+    max_attempts: 0
+    stop_condition: "immediate stop, nudge customer to retry with a different UPI ID"
+
+  funds_blocked_by_mandate:                    # VERIFIED (source: gateway) -- https://razorpay.com/docs/errors/payments/list/
+    source: gateway
+    bucket: B4_STRUCTURAL
+    action: NUDGE_CUSTOMER_LINK
+    max_attempts: 0
+    stop_condition: "immediate stop, customer must release the conflicting mandate or use another account"
+
   # --- PLACEHOLDER reason codes -----------------------------------------
   # No public Razorpay reason-code string confirmed for UPI-mandate
   # lifecycle events as of 2026-09-03. Razorpay's subscription docs
@@ -139,24 +402,44 @@ reason_codes:
   # cancelled the mandate -> subscription moves to pending"), with no
   # machine-readable reason code alongside it. The keys below are our
   # own synthetic names for the generator to emit -- NOT confirmed
-  # Razorpay strings. Flag this explicitly if asked in Q&A.
+  # Razorpay strings. Flag this explicitly if asked in Q&A. `source`
+  # values for these three are our own best-guess assumption too, same
+  # PLACEHOLDER status as the code string itself.
   mandate_revoked_by_customer:                  # PLACEHOLDER -- unverified string
+    source: customer
     bucket: B5_DEAD
     action: NUDGE_REAUTH
     max_attempts: 0
     stop_condition: "immediate stop"
 
   mandate_expired:                              # PLACEHOLDER -- unverified string
+    source: gateway
     bucket: B5_DEAD
     action: NEW_MANDATE_FLOW
     max_attempts: 0
     stop_condition: "immediate stop"
 
   mandate_amount_exceeded:                      # PLACEHOLDER -- unverified string
+    source: gateway
     bucket: B4_STRUCTURAL
     action: ESCALATE_HUMAN
     max_attempts: 0
     stop_condition: "human decision required (split charge or mandate amendment)"
+
+# --- Explicitly considered and excluded (2026-09-03 scan) ----------------
+# Also present in https://razorpay.com/docs/errors/payments/list/ but
+# deliberately NOT added to reason_codes above:
+#   mandate_creation_declined / _expired / _failed / _timeout
+#     -- fire during mandate CREATION (onboarding), not against an
+#        already-live mandate's recurring debit. Out of this system's
+#        scope (a failed-DEBIT recovery agent) for the same reason the
+#        PRD excludes checkout abandonment.
+#   mcc_amount_limit_exceeded, collect_on_mcc_blocked
+#     -- merchant/MCC-configuration-level errors that affect ALL of a
+#        merchant's transactions uniformly, not a per-customer/per-mandate
+#        condition. No retry timing or customer-side action changes the
+#        outcome, so there's no recovery play to encode here -- these
+#        belong in a merchant-config alert, not this matrix.
 
 # --- Congestion override -- the classifier's #1 USP ----------------------
 # B1_CONGESTION is never reached by a direct reason_codes lookup. It's an
