@@ -462,6 +462,10 @@ congestion_override:
   reclassify_after_max_attempts:
     # Resolution 2026-09-03: after 2 failed B1_CONGESTION retries, stop
     # guessing "congestion" and fall back to the next-best explanation.
+    # DEFERRED 2026-09-03: not wired into classify() (M3) -- needs
+    # multi-attempt retry history a single fresh FailureEvent doesn't
+    # carry. Belongs to M4/M5, which track attempts over time. This block
+    # is written and waiting, not forgotten -- see DECISIONS.md.
     condition: "2 failed B1_CONGESTION retries"
     if_no_balance_failure_history: B3_TRANSIENT
     else: B2_BALANCE

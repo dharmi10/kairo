@@ -1,10 +1,11 @@
 """M2 -- the hidden ground-truth oracle.
 
 Answers exactly one question: would a retry AT A GIVEN TIME succeed?
-`oracle()` is a pure function of (event, retry_time, matrix) -- no
-attempt-number term, no hidden mutable state. See DECISIONS.md
-("Oracle model: conditional, not independent-per-attempt") and the
-README for why this must be conditional on context, not drawn
+`oracle()` is a pure function of (event, retry_time) -- no attempt-number
+term, no hidden mutable state, no matrix lookup (ground truth is read from
+`event["_true_bucket"]`, stamped by the generator -- see generate.py).
+See DECISIONS.md ("Oracle model: conditional, not independent-per-attempt")
+and the README for why this must be conditional on context, not drawn
 independently per attempt.
 
 ALL probabilities below are documented ASSUMPTIONS calibrated to keep the
@@ -16,7 +17,6 @@ import calendar
 from datetime import date, datetime
 
 from app.config import settings
-from app.matrix import DecisionMatrix
 
 # --- THE assumption block -------------------------------------------------
 # Every number the oracle can return lives here, in one place, so it can be
@@ -51,44 +51,23 @@ def _next_payday_on_or_after(start: date, typical_credit_day: int) -> date:
     return date(year, month, day)
 
 
-def true_bucket(event: dict, matrix: DecisionMatrix) -> str:
-    """The event's REAL underlying bucket, for ground-truth purposes only.
-
-    This is not the classifier (M3, not yet built) -- there's no confidence
-    score, no signal list, no Decision record. It's a direct reuse of the
-    same declarative condition already sitting in decision_matrix.yaml's
-    congestion_override block, so that congestion is a genuine latent
-    pattern in the data (discoverable via timing + history) rather than an
-    apparent correlation with nothing real behind it. The classifier's
-    later job is to rediscover this same condition from the event alone --
-    this function is what makes that a real inference problem instead of a
-    tautology.
-    """
-    reason = event["error"]["reason"]
-    play = matrix.reason_codes.get(reason)
-    if play is None:
-        return "B_UNKNOWN"  # not reachable by construction -- the generator only emits matrix-known codes
-
-    override = matrix.congestion_override
-    if reason in override["applies_to_reasons"]:
-        lo, hi = override["condition"]["failed_at_hour_between"]
-        failed_at: datetime = event["failed_at"]
-        in_window = lo <= failed_at.hour < hi
-        no_balance_history = (
-            event["customer_history"]["prior_insufficient_funds_90d"]
-            == override["condition"]["prior_insufficient_funds_90d"]
-        )
-        if in_window and no_balance_history:
-            return override["reclassify_to"]
-
-    return play["bucket"]
-
-
-def oracle(event: dict, retry_time: datetime, matrix: DecisionMatrix) -> float:
+def oracle(event: dict, retry_time: datetime) -> float:
     """Would a retry at `retry_time` succeed? Returns a probability in
     [0, 1]. Callers draw against it with their own RNG -- this function
-    only computes the probability, it never samples."""
-    bucket = true_bucket(event, matrix)
+    only computes the probability, it never samples. Pure function of
+    exactly (event, retry_time), per the original spec.
+
+    Reads ground truth from `event["_true_bucket"]`, stamped by the
+    generator at generation time (generator/generate.py::_decide_true_bucket)
+    -- NOT recomputed here. Resolution 2026-09-03: ground truth used to be
+    derived on the fly from the same congestion_override condition
+    classify() reads, which made classifier-vs-oracle agreement a
+    tautology on any attempt_number==1 batch. It's now decided once, with
+    injected noise, at generation time; this function (and grading) just
+    reads the stamped value, which is also why `matrix` dropped out of
+    this function's signature entirely.
+    """
+    bucket = event["_true_bucket"]
 
     if bucket == "B2_BALANCE":
         typical_credit_day = event["customer_history"]["typical_credit_day"]

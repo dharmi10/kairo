@@ -266,6 +266,216 @@ shape (webhook-shaped), not the flattened DB row shape — those are
 different layers by design; the ingestion tier (not yet built) is what
 flattens+enriches into DB columns later.
 
+## 2026-09-03 — Phase 3: classifier built and graded against the oracle
+
+`backend/classifier/classify.py` — pure function `classify(event, matrix)`,
+no side effects. Path priority: unknown-code check, then congestion
+override, then ambiguity handling (keyed off the YAML's `ambiguous: true`
+flag generically, not a hardcoded reason-code name), then base
+lookup + balance-pattern boost, with a confidence floor applied to every
+path's output (below `settings.unknown_bucket_confidence_threshold` ->
+B_UNKNOWN, original confidence preserved rather than zeroed).
+
+**Grading result, and why it's ~100% and that's not suspicious:**
+`classifier/grade.py` grades `classify()` against `oracle.true_bucket()`
+across the M2 seed=42 batch (500 events) — 100.0% accuracy, zero
+misclassifications. This is expected, not impressive: both functions
+share the exact same `congestion_override` lookup from the YAML, so they
+cannot disagree on bucket for any event with `attempt_number == 1` — which
+is every event M2 generates (see Phase 2 entry above). The one place
+`classify()` and the oracle are *designed* to diverge — the
+ambiguity-reclassification path, active only when `attempt_number >= 2` —
+never fires in M2's data. `grade.py` also grades a second, hand-built set
+of `attempt_number=2` events specifically to exercise that path: 0%
+"accuracy" there, entirely `B3_TRANSIENT -> B5_DEAD`, which is the
+intended divergence (classify()'s heuristic guess under real uncertainty
+vs. the oracle's attempt-number-blind ground truth), not a bug.
+
+**Unit tests:** `backend/tests/test_classifier.py`, 19 tests, all passing
+— one per path (including priority ordering between congestion override
+and ambiguity handling), the unknown-code case, the confidence floor
+(tested directly against the helper since no live path currently produces
+a sub-threshold confidence), purity/no-mutation checks, and a
+parametrized check that ambiguity handling generalizes to all three
+reclassified decline codes without being special-cased by name. Added
+`pytest==8.3.4` to requirements.txt and a `pytest.ini` (`pythonpath = .`)
+so `app`/`generator`/`classifier` import cleanly regardless of invocation
+directory.
+
+## 2026-09-03 — Ground truth decoupled from classifier config, with noise
+
+Fixed the tautology from Phase 3's grading (100% accuracy because
+`classify()` and ground-truth resolution shared the same
+`congestion_override` lookup). Ground truth is now decided once, at
+generation time, and stamped on the event as `_true_bucket`
+(`generator/generate.py::_decide_true_bucket`) — `classifier/classify.py`
+never reads it (`tests/test_classifier.py::test_classify_never_reads_true_bucket`,
+parametrized across 4 paths, uses a dict subclass that raises on ANY
+access to that key — subscript, `.get()`, or `in` — so a read via any
+normal dict-access idiom fails the test, not just a literal
+`event["_true_bucket"]`). `oracle()`'s signature dropped back to exactly
+`(event, retry_time)` — it now reads `_true_bucket` instead of
+recomputing it, so `matrix` fell out of the signature entirely, matching
+the originally-specified pure-function shape.
+
+**Noise, as specified:** scoped to `congestion_override.applies_to_reasons`
+(`gateway_technical_error`, `payment_failed`) only — not broadened to
+every B3-bucketed technical code. `CONGESTION_FALSE_POSITIVE_RATE = 0.15`
+(in-window, technical reason, no balance history, but NOT actually
+congestion — flips to `B3_TRANSIENT` 60% / `B2_BALANCE` 40%, ASSUMPTION,
+no data to weight this precisely) and `CONGESTION_FALSE_NEGATIVE_RATE =
+0.10` (outside window, technical reason, no balance history, but IS
+actually congestion). Documented in `generator/generate.py` and the
+README.
+
+**Result on seed=42, n=500: 98.0% overall accuracy, not "the 80s".**
+Confusion is concentrated exactly where expected — `B2_BALANCE ->
+B1_CONGESTION: 4`, `B3_TRANSIENT -> B1_CONGESTION: 3` (over-calling
+congestion, the false-positive case) and `B1_CONGESTION -> B3_TRANSIENT: 3`
+(missing it, the false-negative case) — with B1_CONGESTION precision
+89.7% / recall 95.3%, and every other bucket at or near 100%. The
+overall number lands far above "the 80s" purely because of **dilution**:
+noise is scoped to the congestion-boundary subset (~85 of 500 events are
+even eligible), so a 15%/10% *within-subset* error rate works out to
+~10 misclassified events out of 500 overall — 2%, not 20%. This wasn't
+adjusted to hit a target range; it's what the specified rates, scoped as
+specified, produce. Flagged to the user rather than silently widening
+the noise scope to manufacture a lower number — that's a real modelling
+decision (how broadly "technical reason" should mean for noise purposes),
+not something to change without asking. **Confirmed with the user
+2026-09-03: keep as-is.** 98.0% aggregate accuracy stands; B1_CONGESTION
+precision (89.7%) / recall (95.3%) is the number to cite in the pitch as
+"what the classifier actually detects" — the aggregate is diluted by the
+4 buckets that carry zero injected noise, so it isn't the right headline
+metric for detection quality.
+
+## 2026-09-03 — Deliberate deferral: congestion_override.reclassify_after_max_attempts
+
+Confirmed with the user: the "after 2 failed B1_CONGESTION retries,
+reclassify to B3_TRANSIENT/B2_BALANCE" rule stays unimplemented in
+`classify()`. It needs multi-attempt retry history that doesn't exist on
+a single fresh `FailureEvent` — implementing it in the classifier would
+either break purity (reading external mandate state) or require inventing
+fields M2 doesn't produce. Belongs to M4 (policy engine) / M5 (executor),
+where retry history is actually tracked. Recorded here so it isn't lost —
+the YAML's `reclassify_after_max_attempts` block is written and waiting,
+just not wired to anything yet.
+
+## 2026-09-03 — Phase 4: policy engine built
+
+`backend/policy/policy.py` — pure function `evaluate_policy(event,
+classification, mandate_history) -> (verdict, reasons)`, tuple return
+matching the user's literal spec. All 8 PRD M4 rules plus the fail-closed
+data-quality gate implemented as 9 independent checks, each contributing
+a reason string (pass or fail) — more exhaustive than the PRD's own
+abbreviated audit example on purpose (see module docstring: "the audit
+record is the product"). Verdict resolution is worst-wins (ESCALATE >
+BLOCK > ALLOW), so e.g. `payment_risk_check_failed` (both risk-flagged
+AND B5_DEAD) correctly resolves to ESCALATE, not BLOCK, without rule 5
+needing to know about rule 2.
+
+**Design choices worth remembering:**
+- "Now" for cooling-off/cycle-age purposes is `event["failed_at"]`, not a
+  separate injected clock parameter — keeps the signature exactly
+  `(event, classification, mandate_history)` as specified.
+- Max-contacts cap (rule 9) is NOT conditioned on whether the eventual
+  action is a customer-facing nudge vs. a silent retry — policy() doesn't
+  know the executor's action choice yet (M5). Treated as a flat cap,
+  matching the PRD's table literally. Flagged as a modelling
+  simplification, not a verified distinction — M5 may need to revisit.
+- Reused `app/config.py` settings (`global_max_retry_attempts`,
+  `min_cooling_off_hours`, `max_contacts_per_cycle`, `recovery_cycle_days`,
+  `high_value_threshold_inr`, `unknown_bucket_confidence_threshold`) —
+  all six were already defined there since Phase 1, unused until now.
+
+**Tests:** `tests/test_policy.py`, 23 tests. Includes the three
+explicitly-requested critical properties: a fixed-seed 2000-combination
+fuzz test proving B5_DEAD never resolves to ALLOW (varies confidence,
+amount, reason code, and all mandate_history fields, including values
+that also trigger other ESCALATE/BLOCK rules simultaneously); a simulated
+7-day/12h-spaced retry cycle proving the attempt cap holds for the rest
+of the window once hit; and a dedicated cooling-off test at 1/30/60/90/119
+minutes (all under the 2h threshold, all with attempts=1, nowhere near
+the cap of 3) proving cooling-off blocks independently of the attempt cap.
+
+**Flagged, not fixed (Phase 2 concern, out of Phase 4 scope): the
+high-value escalation rule interacts badly with Phase 2's amount bands.**
+`policy/report.py` (`python -m policy.report`) shows 53.6% of the M2
+batch trips `high_value_amount` and the overall verdict split is 54.0%
+ESCALATE / 39.2% ALLOW / 6.8% BLOCK — escalating over half of everything
+to a human undercuts the "autonomous agent" pitch. Cause: Phase 2's
+`AMOUNT_BANDS_INR` (SIP up to ₹50,000, EMI up to ₹25,000, INSURANCE up to
+₹50,000, sampled uniformly) were picked for category-plausibility, not
+against the ₹5,000 threshold M4 introduced later — the two were never
+checked against each other. Needs a decision: tighten the amount bands
+(Phase 2), or accept that real SIP/EMI/insurance amounts legitimately
+often exceed ₹5,000 and a majority-escalate outcome is honest. Not
+changed without the user's say-so.
+
+## 2026-09-03 — Fixed the 54% escalation collision: threshold and amount distribution set together
+
+**Root cause confirmed as the user diagnosed it: the amount *distribution*,
+not the threshold.** Phase 2's `AMOUNT_BANDS_INR` sampled uniformly across
+wide bands (SIP up to Rs.50,000, EMI up to Rs.25,000, INSURANCE up to
+Rs.50,000) — a uniform distribution over a wide band puts far too much
+mass above any reasonable escalation threshold, because real payment
+amounts are right-skewed (most debits small, a thin tail of large ones),
+not flat.
+
+**Fix 1 — replaced uniform bands with per-category log-normal sampling**
+(`generator/generate.py::_sample_amount_inr`, `AMOUNT_DISTRIBUTION_INR`).
+Targets given by the user: median + approximate P99 tail per category;
+`sigma` is *derived* from that ratio (`sigma = ln(tail/median) / z_p99`,
+`z_p99 ≈ 2.326`), not independently chosen — so the only real inputs are
+the two numbers the user specified per category. Clipped to
+`[floor, cap]` since a log-normal's tail is technically unbounded and an
+occasional 10x-the-target-tail draw isn't a realistic mandate amount.
+Actual medians on seed=42: OTT 331 (target 300), UTILITY 1066 (target
+900), SIP 2072 (target 2000), INSURANCE 3141 (target 3000), EMI 5879
+(target 6000) — close enough to the targets to trust the derivation.
+
+**Fix 2 — raised `high_value_threshold_inr` from Rs.5,000 to Rs.10,000**
+(`app/config.py`). Updated `tests/test_policy.py`'s three
+threshold-dependent tests to reference `settings.high_value_threshold_inr`
+instead of the old hardcoded `5000`/`5001` literals — they would have
+silently passed-for-the-wrong-reason otherwise (both values sit under the
+new 10,000 threshold).
+
+**Result on seed=42, n=500: ESCALATE = 10.0%** (ALLOW 78.4%, BLOCK
+11.6%) — right at the bottom edge of the requested 10-15% band. Not
+further tuned; landed there from the specified targets on the first run.
+
+**The reasoning to keep, going forward: the escalation threshold and the
+amount distribution are not independent parameters — either one alone is
+meaningless.** A threshold is only "high-value" relative to what the
+distribution actually produces below it; changing one without checking
+the other (which is exactly what happened the first time) can silently
+turn "escalate the rare big one" into "escalate over half of everything,"
+undercutting the entire autonomous-agent premise without any single line
+of code being wrong on its own. Any future change to either the amount
+distribution or the threshold should re-run `python -m policy.report` and
+check the aggregate ESCALATE rate before considering it done.
+
+**Regulatory cross-check (per user request — reported, not assumed):**
+searched for NPCI/RBI's Additional Factor Authentication (AFA) threshold
+for UPI Autopay / e-mandate recurring debits. Multiple 2026 sources
+(BusinessToday, Upstox, NewsBytesApp, Wiretel, IndiaAIPulse, OfficeNewz —
+secondary financial-news reporting, not fetched directly from an RBI
+primary document) consistently describe an RBI e-mandate framework
+circular dated **21 April 2026** that raised/consolidated the AFA-exempt
+limit to **Rs.15,000 per transaction generally**, with an enhanced
+**Rs.1,00,000 exemption for insurance premiums, mutual fund
+subscriptions, and credit card bill payments** specifically. One source
+additionally notes recurring EMI auto-debits via e-mandates are exempted
+from the newer 2FA digital-lending requirements entirely, to avoid
+disrupting repayment schedules. All of `AMOUNT_DISTRIBUTION_INR`'s P99
+tails sit under these limits (EMI 40k, SIP/INSURANCE 25-30k vs. a 1L
+enhanced exemption; OTT/UTILITY trivially under the general 15k) — no
+band needed adjusting to comply. Worth citing in the pitch as supporting
+context for why the amount assumptions are realistic, with the caveat
+that this is secondary-source reporting on the regulation, not a citation
+of RBI's own circular text.
+
 ## 2026-09-03 — Tooling
 
 No Python 3.11 installed on this machine. `py -0p` listed a 3.13, but its

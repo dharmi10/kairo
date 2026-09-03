@@ -12,6 +12,7 @@ a measurement -- flagged inline where it isn't already covered by
 distribution.py or oracle.py.
 """
 
+import math
 import random
 from datetime import date, datetime, timedelta
 
@@ -32,16 +33,31 @@ RESTRICTED_WINDOW_SHARE = 0.35
 # merchant-category mix.
 MERCHANT_CATEGORIES = ["OTT", "SIP", "EMI", "UTILITY", "INSURANCE"]
 
-# ASSUMPTION: per-category amount bands (INR), loosely realistic (OTT
-# subscriptions are cheap, SIPs/insurance premiums are large). Not sourced
-# from any Razorpay data.
-AMOUNT_BANDS_INR = {
-    "OTT": (99, 999),
-    "SIP": (500, 50_000),
-    "EMI": (999, 25_000),
-    "UTILITY": (199, 5_000),
-    "INSURANCE": (999, 50_000),
+# ASSUMPTION (revised 2026-09-03): per-category amount distributions,
+# right-skewed (log-normal), not uniform bands. Real UPI Autopay traffic
+# is heavily right-skewed -- most debits small, a thin tail of large ones
+# -- and uniform sampling over a wide band (the original version of this
+# table) put far too much mass in the tail, which collided with M4's
+# high-value escalation rule and drove escalation to 54% of the batch
+# (see DECISIONS.md, "escalation threshold and amount distribution have
+# to be set together"). `median` and `p99_tail` are the user-specified
+# targets; `sigma` is derived from them (see _sample_amount_inr below),
+# not independently chosen. `floor`/`cap` clip the unbounded log-normal
+# tail to a sane range. Not sourced from any Razorpay data -- these
+# medians are checked against the RBI April-2026 e-mandate AFA-exempt
+# thresholds in the README, not derived from them.
+AMOUNT_DISTRIBUTION_INR = {
+    "OTT": {"median": 300, "p99_tail": 1_500, "floor": 49, "cap": 3_000},
+    "UTILITY": {"median": 900, "p99_tail": 5_000, "floor": 99, "cap": 10_000},
+    "SIP": {"median": 2_000, "p99_tail": 25_000, "floor": 199, "cap": 50_000},
+    "INSURANCE": {"median": 3_000, "p99_tail": 30_000, "floor": 299, "cap": 60_000},
+    "EMI": {"median": 6_000, "p99_tail": 40_000, "floor": 499, "cap": 80_000},
 }
+
+# z-score of the 99th percentile of a standard normal distribution --
+# used to derive each category's log-normal sigma from its target
+# median/tail ratio (see _sample_amount_inr).
+_Z_P99 = 2.326
 
 # ASSUMPTION: reason codes involving OTP/CVV/auth happen at the
 # authentication step; everything else at authorization. Not verified
@@ -56,6 +72,36 @@ AUTHENTICATION_STEP_REASONS = {
     "incorrect_cvv",
     "reqauth_mandate_not_acknowledged",
 }
+
+# --- Ground-truth noise around the congestion boundary (2026-09-03) -------
+# Resolution: ground truth must be decided HERE, at generation time, and
+# stamped on the event as `_true_bucket` -- not derived later from the same
+# congestion_override config the classifier itself reads. Before this
+# change, oracle.py's true_bucket() recomputed ground truth from that same
+# YAML condition classify() uses, so the two could never disagree on any
+# event with attempt_number == 1 (all of M2's output) -- grading measured
+# "does the classifier's config match the oracle's config", not "does the
+# classifier detect anything". These two rates make disagreement possible:
+# `classify()` has no access to them or to `_true_bucket` (see
+# tests/test_classifier.py::test_classify_never_reads_true_bucket).
+#
+# ASSUMPTION, not measurement -- documented here and in the README.
+CONGESTION_FALSE_POSITIVE_RATE = 0.15  # in-window, technical reason, no balance history -- but NOT actually congestion
+CONGESTION_FALSE_NEGATIVE_RATE = 0.10  # outside window, technical reason, no balance history -- but IS actually congestion (NPCI congestion isn't perfectly bounded by the window)
+
+# When a false positive flips away from B1, it becomes one of these two
+# plausible real causes. ASSUMPTION: no data to weight this precisely: a
+# technical-looking failure that wasn't really congestion is modelled as
+# somewhat more likely to be a genuine transient hiccup than a first-time
+# (unflagged) balance issue.
+CONGESTION_FALSE_POSITIVE_FLIP_TARGETS = ["B3_TRANSIENT", "B2_BALANCE"]
+CONGESTION_FALSE_POSITIVE_FLIP_WEIGHTS = [60, 40]
+
+# Noise is scoped to the same reason codes the classifier's congestion
+# override itself considers (matrix.congestion_override.applies_to_reasons)
+# -- we're modelling error in detecting congestion among failures that
+# already look technical, not inventing congestion on codes that have
+# nothing to do with it (e.g. incorrect_cvv).
 
 
 def _error_code_for_source(source: str) -> str:
@@ -80,6 +126,19 @@ def _sample_failed_at(rng: random.Random) -> datetime:
     return datetime(day.year, day.month, day.day, hour, rng.randint(0, 59), rng.randint(0, 59))
 
 
+def _sample_amount_inr(rng: random.Random, merchant_category: str) -> int:
+    """Log-normal per category: median = target median, and sigma chosen
+    so the target p99_tail lands at roughly the 99th percentile
+    (sigma = ln(tail / median) / z_p99). Clipped to [floor, cap] since a
+    log-normal's tail is technically unbounded and an occasional
+    draw-of-10x-the-target-tail is not a realistic mandate amount."""
+    params = AMOUNT_DISTRIBUTION_INR[merchant_category]
+    mu = math.log(params["median"])
+    sigma = math.log(params["p99_tail"] / params["median"]) / _Z_P99
+    amount = rng.lognormvariate(mu, sigma)
+    return round(min(max(amount, params["floor"]), params["cap"]))
+
+
 def _sample_prior_insufficient_funds(rng: random.Random, reason: str) -> int:
     # ASSUMPTION: insufficient_funds failures more often carry a recurring
     # balance-history pattern; everything else mostly doesn't. This is
@@ -93,6 +152,35 @@ def _sample_prior_insufficient_funds(rng: random.Random, reason: str) -> int:
     return rng.choices([0, 1, 2, 3], weights=[70, 20, 7, 3])[0]
 
 
+def _decide_true_bucket(event: dict, rng: random.Random, matrix: DecisionMatrix) -> str:
+    """The event's REAL underlying bucket -- ground truth, hidden from the
+    classifier. Consults the same congestion_override condition the
+    classifier reads (so there's a real, coherent rule to be noisy around,
+    not noise for its own sake), then deliberately disagrees with it at
+    the rates above. This is what makes classification a genuine inference
+    problem instead of a config-agreement tautology."""
+    reason = event["error"]["reason"]
+    nominal_bucket = matrix.reason_codes[reason]["bucket"]
+
+    override = matrix.congestion_override
+    if reason in override["applies_to_reasons"]:
+        lo, hi = override["condition"]["failed_at_hour_between"]
+        in_window = lo <= event["failed_at"].hour < hi
+        no_balance_history = (
+            event["customer_history"]["prior_insufficient_funds_90d"]
+            == override["condition"]["prior_insufficient_funds_90d"]
+        )
+        if in_window and no_balance_history:
+            if rng.random() < CONGESTION_FALSE_POSITIVE_RATE:
+                return rng.choices(CONGESTION_FALSE_POSITIVE_FLIP_TARGETS, weights=CONGESTION_FALSE_POSITIVE_FLIP_WEIGHTS)[0]
+            return override["reclassify_to"]
+        if (not in_window) and no_balance_history:
+            if rng.random() < CONGESTION_FALSE_NEGATIVE_RATE:
+                return override["reclassify_to"]
+
+    return nominal_bucket
+
+
 def generate_event(i: int, rng: random.Random, matrix: DecisionMatrix, distribution: dict[str, float]) -> dict:
     reasons = list(distribution.keys())
     weights = list(distribution.values())
@@ -101,14 +189,13 @@ def generate_event(i: int, rng: random.Random, matrix: DecisionMatrix, distribut
     source = play["source"]
 
     merchant_category = rng.choice(MERCHANT_CATEGORIES)
-    lo, hi = AMOUNT_BANDS_INR[merchant_category]
-    amount_inr = rng.randint(lo, hi)
+    amount_inr = _sample_amount_inr(rng, merchant_category)
 
     failed_at = _sample_failed_at(rng)
 
     mandate_id = f"mandate_{i:06d}"
 
-    return {
+    event = {
         "event_id": f"evt_{i:06d}",
         "payment_id": f"pay_{i:06d}",
         "mandate_id": mandate_id,
@@ -139,6 +226,12 @@ def generate_event(i: int, rng: random.Random, matrix: DecisionMatrix, distribut
             "mandate_age_days": rng.randint(7, 730),
         },
     }
+
+    # Hidden ground truth -- stamped last (needs the fields above), never
+    # read by classify(). Leading underscore: not part of the real
+    # Razorpay webhook shape, internal/test-only.
+    event["_true_bucket"] = _decide_true_bucket(event, rng, matrix)
+    return event
 
 
 def generate_batch(count: int, seed: int, matrix: DecisionMatrix) -> list[dict]:

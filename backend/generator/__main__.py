@@ -13,7 +13,6 @@ from pathlib import Path
 from app.config import settings
 from app.matrix import load_decision_matrix
 from generator.generate import generate_batch
-from generator.oracle import true_bucket
 
 DEFAULT_OUT = Path(__file__).resolve().parent / "output" / "events_seed{seed}.json"
 
@@ -26,7 +25,7 @@ def _print_table(title: str, rows: list[tuple[str, int, float]]) -> None:
         print(f"  {label:<{label_width}}  {count:>5}   {pct:5.1f}%")
 
 
-def print_summary(events: list[dict], matrix) -> None:
+def print_summary(events: list[dict]) -> None:
     total = len(events)
 
     by_reason = Counter(e["error"]["reason"] for e in events)
@@ -47,9 +46,9 @@ def print_summary(events: list[dict], matrix) -> None:
         ),
     )
 
-    by_bucket = Counter(true_bucket(e, matrix) for e in events)
+    by_bucket = Counter(e["_true_bucket"] for e in events)
     _print_table(
-        "Ground-truth bucket distribution (ORACLE ONLY -- not the classifier)",
+        "Ground-truth bucket distribution (hidden _true_bucket -- not the classifier's output)",
         sorted(
             [(bucket, n, 100 * n / total) for bucket, n in by_bucket.items()],
             key=lambda r: -r[1],
@@ -86,7 +85,7 @@ def main() -> None:
         json.dump(events, f, indent=2, default=_json_default)
 
     print(f"Generated {len(events)} events (seed={args.seed}) -> {out_path}")
-    print_summary(events, matrix)
+    print_summary(events)
 
 
 if __name__ == "__main__":

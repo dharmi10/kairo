@@ -17,7 +17,13 @@ class Settings(BaseSettings):
     min_cooling_off_hours: int = 2
     max_contacts_per_cycle: int = 2
     recovery_cycle_days: int = 7
-    high_value_threshold_inr: int = 5000
+    # Raised from Rs.5,000 to Rs.10,000 (2026-09-03): the threshold and the
+    # amount distribution have to be set together -- Rs.5,000 against
+    # Phase 2's original uniform amount bands drove 54% of the batch to
+    # ESCALATE. See DECISIONS.md and README "Amount distribution and the
+    # escalation threshold" for the reasoning and the RBI AFA-threshold
+    # cross-check.
+    high_value_threshold_inr: int = 10_000
 
     # Resolution: confidence below this, or a reason code not in the matrix, -> B_UNKNOWN
     unknown_bucket_confidence_threshold: float = 0.5
