@@ -1,0 +1,196 @@
+# Kairo — Recovery Decision Matrix
+# Single source of truth for reason-code -> bucket -> play -> limits.
+# The classifier and policy engine read this file; nothing here should
+# ever be duplicated as a hardcoded if-statement elsewhere in the app.
+#
+# Provenance key used in comments below:
+#   VERIFIED    -- confirmed against razorpay.com/docs/api/errors/ and
+#                  razorpay.com/docs/errors/payments/upi/ on 2026-09-03.
+#   PLACEHOLDER -- no public Razorpay reason-code string found for this
+#                  behaviour as of 2026-09-03. The bucket/play/limits are
+#                  our own documented assumption, not a confirmed string.
+#                  Do not present these as verified in the pitch.
+
+matrix_version: "2026-09-03"
+
+buckets:
+  B1_CONGESTION:
+    class: soft
+    label: "Congestion / timing"
+  B2_BALANCE:
+    class: soft
+    label: "Balance timing"
+  B3_TRANSIENT:
+    class: soft
+    label: "Transient technical failure"
+  B4_STRUCTURAL:
+    class: soft
+    label: "Structural / limit"
+  B5_DEAD:
+    class: hard
+    label: "Dead instrument / mandate"
+  B_UNKNOWN:
+    class: hard
+    label: "Unrecognised reason code or low-confidence classification"
+
+reason_codes:
+  # --- VERIFIED reason codes -------------------------------------------
+  gateway_technical_error:                     # VERIFIED (source: gateway)
+    bucket: B3_TRANSIENT
+    action: RETRY
+    delay_hours: 3
+    max_attempts: 3
+    snap_to_window: true
+    stop_condition: "3 consecutive fails in 24h -> escalate to notify"
+
+  insufficient_funds:                          # VERIFIED (source: customer)
+    bucket: B2_BALANCE
+    action: RETRY_AT_INCOME_WINDOW
+    max_attempts: 2
+    snap_to_window: true
+    pre_nudge_hours: 12
+    stop_condition: "2 fails across 2 income windows -> pause mandate, request customer action"
+
+  payment_timed_out:                           # VERIFIED (source: gateway)
+    bucket: B3_TRANSIENT
+    action: RETRY
+    delay_hours: 0        # same day, next safe window
+    max_attempts: 2
+    snap_to_window: true
+    stop_condition: "2 fails -> switch to customer-initiated link"
+
+  authorisation_declined_by_psp:                # VERIFIED (source: gateway)
+    bucket: B3_TRANSIENT
+    action: RETRY
+    delay_hours: 5         # 4-6 hrs
+    max_attempts: 2
+    snap_to_window: true
+    stop_condition: "2 fails -> treat as B4_STRUCTURAL, channel fallback"
+
+  card_expired:                                 # VERIFIED (source: customer)
+    bucket: B5_DEAD
+    action: NUDGE_REAUTH
+    max_attempts: 0
+    stop_condition: "immediate stop"
+
+  debit_instrument_blocked:                     # VERIFIED (source: customer)
+    bucket: B5_DEAD
+    action: NUDGE_REAUTH
+    max_attempts: 0
+    stop_condition: "immediate stop"
+
+  payment_risk_check_failed:                    # VERIFIED (source: gateway/business)
+    bucket: B5_DEAD
+    action: ESCALATE_HUMAN
+    max_attempts: 0
+    stop_condition: "immediate stop + human queue"
+
+  payment_cancelled:                            # VERIFIED (source: customer)
+    bucket: B4_STRUCTURAL
+    action: NUDGE_REENGAGE
+    max_attempts: 1
+    stop_condition: "1 nudge, then stop"
+
+  authentication_failed:                        # VERIFIED (source: customer/gateway)
+    bucket: B4_STRUCTURAL
+    action: NUDGE_CUSTOMER_LINK
+    max_attempts: 1
+    stop_condition: "1 nudge, then stop"
+
+  incorrect_otp:                                # VERIFIED (source: customer)
+    bucket: B4_STRUCTURAL
+    action: NUDGE_CUSTOMER_LINK
+    max_attempts: 1
+    stop_condition: "1 nudge, then stop"
+    # CORRECTED 2026-09-03: recovery-decision-matrix.md's original draft used
+    # `invalid_otp`. Razorpay's documented string is `incorrect_otp`.
+
+  incorrect_cvv:                                # VERIFIED (source: customer)
+    bucket: B4_STRUCTURAL
+    action: NUDGE_CUSTOMER_LINK
+    max_attempts: 1
+    stop_condition: "1 nudge, then stop"
+
+  transaction_daily_limit_exceeded:             # VERIFIED (source: gateway)
+    bucket: B4_STRUCTURAL
+    action: RETRY
+    delay_hours: 24
+    max_attempts: 2
+    snap_to_window: true
+    stop_condition: "2 fails -> channel fallback"
+    # CORRECTED 2026-09-03: replaces the undocumented "daily transaction
+    # limit breached" placeholder used in the original draft.
+
+  payment_failed:                               # VERIFIED (source: gateway) -- generic catch-all
+    bucket: B3_TRANSIENT
+    action: RETRY
+    max_attempts: 2
+    snap_to_window: true
+    ambiguous: true
+    stop_condition: "2 fails -> reclassify as B5_DEAD, notify"
+    # Razorpay's docs confirm this is a generic gateway decline with
+    # "no specific error code received from gateway". The classifier
+    # handles the probabilistic reclassification after one failed retry.
+
+  # --- PLACEHOLDER reason codes -----------------------------------------
+  # No public Razorpay reason-code string confirmed for UPI-mandate
+  # lifecycle events as of 2026-09-03. Razorpay's subscription docs
+  # describe mandate cancellation only narratively ("customer has
+  # cancelled the mandate -> subscription moves to pending"), with no
+  # machine-readable reason code alongside it. The keys below are our
+  # own synthetic names for the generator to emit -- NOT confirmed
+  # Razorpay strings. Flag this explicitly if asked in Q&A.
+  mandate_revoked_by_customer:                  # PLACEHOLDER -- unverified string
+    bucket: B5_DEAD
+    action: NUDGE_REAUTH
+    max_attempts: 0
+    stop_condition: "immediate stop"
+
+  mandate_expired:                              # PLACEHOLDER -- unverified string
+    bucket: B5_DEAD
+    action: NEW_MANDATE_FLOW
+    max_attempts: 0
+    stop_condition: "immediate stop"
+
+  mandate_amount_exceeded:                      # PLACEHOLDER -- unverified string
+    bucket: B4_STRUCTURAL
+    action: ESCALATE_HUMAN
+    max_attempts: 0
+    stop_condition: "human decision required (split charge or mandate amendment)"
+
+# --- Congestion override -- the classifier's #1 USP ----------------------
+# B1_CONGESTION is never reached by a direct reason_codes lookup. It's an
+# override applied on top of gateway_technical_error / payment_failed when
+# the debit timing itself looks like the real cause (see M3).
+congestion_override:
+  applies_to_reasons: [gateway_technical_error, payment_failed]
+  condition:
+    failed_at_hour_between: [10, 13]     # NPCI restricted window, verified 2026-09-03
+    prior_insufficient_funds_90d: 0
+  reclassify_to: B1_CONGESTION
+  confidence: 0.82
+  signal: fired_in_restricted_window
+  play:
+    action: RETRY
+    delay_hours: 0
+    max_attempts: 2
+    snap_to_window: true
+    stop_condition: "2 fails -> reclassify, see reclassify_after_max_attempts below"
+  reclassify_after_max_attempts:
+    # Resolution 2026-09-03: after 2 failed B1_CONGESTION retries, stop
+    # guessing "congestion" and fall back to the next-best explanation.
+    condition: "2 failed B1_CONGESTION retries"
+    if_no_balance_failure_history: B3_TRANSIENT
+    else: B2_BALANCE
+
+# --- Unknown / low-confidence fallback ------------------------------------
+# Resolution 2026-09-03: this is a demo requirement, not optional. Fail
+# closed -- never auto-retry something the classifier isn't confident about.
+unknown_bucket:
+  bucket: B_UNKNOWN
+  action: ESCALATE_HUMAN
+  max_attempts: 0
+  triggers:
+    - "reason code not present in reason_codes above"
+    - "classification confidence < 0.5"
+  stop_condition: "immediate stop + human queue, never auto-retried"
