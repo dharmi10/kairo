@@ -36,8 +36,6 @@ copy .env.example .env
 
 The defaults in `.env` work as-is: a dummy webhook secret, a local SQLite file, no Anthropic key. Without a key, every explanation in the demo comes from a deterministic template instead of Claude, but the decisions and the audit trail are unaffected either way (see `docs/ASSUMPTIONS.md`). `http://127.0.0.1:8000/health` should return `{"status": "ok", ...}`.
 
-> **If `.venv\Scripts\Activate.ps1` won't run:** PowerShell's default execution policy blocks it on a fresh machine. Run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` first, or just use `.venv\Scripts\activate.bat` from `cmd.exe` instead. Every command above uses the `.venv\Scripts\python.exe ...` form so it works without needing to activate anything at all.
-
 **Frontend.** Open a second terminal, keep the backend running:
 
 ```powershell
@@ -45,8 +43,6 @@ cd frontend
 npm install
 npm run dev      # http://localhost:5173
 ```
-
-You'll land on an empty state until a simulation has run, which is what the next section is for.
 
 ## Demoing fail-closed live
 
