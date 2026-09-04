@@ -2,6 +2,8 @@
 ### The decision spine for the UPI Mandate Recovery Agent
 **Razorpay Buildathon — AI Revenue Recovery track**
 
+> Original planning document, written before the build. Superseded in places by [`DECISIONS.md`](../DECISIONS.md), which logs every divergence and why.
+
 ---
 
 ## How to read this document

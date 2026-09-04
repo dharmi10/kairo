@@ -1,5 +1,7 @@
 # PRD — UPI Mandate Recovery Agent
 
+> Original planning document, written before the build. Superseded in places by [`DECISIONS.md`](../DECISIONS.md), which logs every divergence and why.
+
 **Project codename:** RetryIQ
 **Track:** Razorpay Buildathon — AI Revenue Recovery
 **Deadline:** 5 September 2026

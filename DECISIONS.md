@@ -1794,3 +1794,68 @@ Stated plainly rather than allowed to look resolved by omission:
   only**, per architecture-and-security.md sec. 3.5 — unchanged from
   every earlier phase's own statement of this, restated here for
   completeness rather than re-decided.
+
+## 2026-09-04 — README rewritten to eight sections; planning docs and detail moved to docs/
+
+No new features — a documentation restructuring, per explicit
+instruction: the README had grown to ~900 lines across eight build
+phases and stopped being something a judge could read in two minutes.
+
+**`README.md` now covers exactly eight sections, in order:** one-line
+description + the problem (4-5 sentences); the four-stage loop as four
+table rows, not prose; the headline result (recovery-rate delta
+12-18.6pt across 20 seeds; rupee uplift stated as a range, +2.3% to
++68.5%, never a single figure) with a pointer to
+`docs/ASSUMPTIONS.md`; Quickstart (Windows, clean clone, backend +
+frontend + tests, the PowerShell execution-policy trap kept); the
+fail-closed walkthrough (`python -m demo.seed`); a 6-line repo map;
+built-vs-designed in three lines; one closing line pointing at
+`DECISIONS.md`. No features list (the four-stage loop covers it) and no
+mention of build phases or process, per instruction — that content
+lives here, not there.
+
+**Everything that didn't fit moved to `docs/ASSUMPTIONS.md`, not
+deleted:** every simulation assumption with its reasoning (timestamp
+distribution, the oracle's probability table, ground-truth noise, the
+amount-distribution/escalation-threshold coupling, the RNG methodology,
+the 20-seed multi-seed methodology, reason-code verification status),
+plus implementation-level detail for the API (webhook order of
+operations, the two wire shapes), the explanation layer (the PII guard,
+the cache, the fallback), and the dashboard (the four sections, the
+non-live fixture) that the tight README has no room for. The file is
+named for what the user asked it to hold, even though roughly a third
+of its content (the API/M7/dashboard implementation notes) isn't
+strictly "assumptions" — flagged in its own intro sentence rather than
+inventing a second overflow file the instruction didn't ask for.
+
+**`docs/` now holds the three original planning documents** — the PRD,
+`architecture-and-security.md`, and `recovery-decision-matrix.md` —
+moved with `git mv` (history preserved), each with one line added
+directly under its title: *"Original planning document, written before
+the build. Superseded in places by `DECISIONS.md`, which logs every
+divergence and why."* Nothing else in any of the three was touched —
+they stay frozen as the documents actually written before the build,
+including the PRD's own "RetryIQ" codename.
+
+**On "RetryIQ" specifically — already handled correctly, checked, not
+re-done:** the very first entry in this log (2026-09-03, "Scope &
+naming resolutions", item 1) already states the rename to Kairo and
+retires the codename, and no file outside `docs/` (now checked directly:
+`grep -r RetryIQ` across every `.py`/`.md`/`.jsx`/`.js`/`.yaml`/`.json`
+in the repo) carries the old name except the two frozen planning docs
+themselves and this log's own record of the decision. The instruction
+to "note the rename here rather than silently editing the frozen
+planning doc" was already satisfied on day one; this entry confirms
+that rather than adding a redundant second one.
+
+Cross-references updated where they were real links (the README's one
+`[architecture-and-security.md](architecture-and-security.md)` markdown
+link, now pointing at `docs/`); left alone where they were prose
+mentions inside earlier, dated DECISIONS.md entries — those are a
+historical record of what was true when written, not live links, and
+this project's own convention is to add a new dated entry rather than
+edit an old one.
+
+`backend/`, `frontend/`, and every test are unchanged — this was
+documentation and file layout only. 182 backend tests still pass; the
+frontend still builds clean.

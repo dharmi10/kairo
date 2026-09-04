@@ -1,6 +1,8 @@
 # Architecture & Security Design
 ### UPI Mandate Recovery Agent (RetryIQ)
 
+> Original planning document, written before the build. Superseded in places by [`DECISIONS.md`](../DECISIONS.md), which logs every divergence and why.
+
 > **How to read this:** Every section is tagged **[BUILD]** (implement in the 2-day window) or **[DESIGN]** (architected and documented, not implemented — you defend it verbally). This split is deliberate and honest. A judge respects "we designed for this, here's the path" far more than a vague claim that it's handled.
 
 ---
