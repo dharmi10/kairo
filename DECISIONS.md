@@ -1341,3 +1341,95 @@ measured with a stub client injected (`explain/demo.py::StubClient`).
   (`test_every_failure_mode_falls_back_to_a_non_empty_template`,
   `empty_response` case). The cache means this ceiling is paid ~23 times
   per batch.
+
+## 2026-09-04 — Razorpay envelope adapter, and the LLM path ships on templates
+
+### The webhook now accepts Razorpay's real payload shape
+
+Closed the gap flagged at the end of Phase 7: `backend/app/razorpay_adapter.py`
+maps Razorpay's actual `payment.failed` webhook envelope
+(`{"event": ..., "payload": {"payment": {"entity": {...}}}}`) onto the
+same internal `FailureEventIn` the flat PRD-sec.-6 shape already builds.
+Both shapes are accepted on `POST /webhook/payment-failed`, signed and
+dispatched identically — the adapter only changes how the body is
+*interpreted*, never how it's *authenticated*.
+
+Verified against Razorpay's own docs via WebFetch (2026-09-04) rather
+than assumed:
+
+- The **payment entity** fields (`id`, `amount` in paise, `vpa`, `email`,
+  `contact`, `notes`, `error_code`/`error_description`/`error_source`/
+  `error_step`/`error_reason`, `created_at`) — confirmed against a live
+  example at razorpay.com/docs/api/payments/entity/.
+- The **signature header** (`X-Razorpay-Signature`) — already assumed
+  correctly in Phase 7.
+- **The real idempotency mechanism** — an `x-razorpay-event-id` **header**
+  ("unique per event"), *not* a body field. This corrects an implicit
+  assumption in this project: nothing in a real payment entity or
+  envelope carries an `event_id`. The webhook handler now reads
+  `X-Razorpay-Event-Id` and only falls back to a `notes.event_id` testing
+  affordance when the header is absent.
+- The literal top-level envelope wrapper (`entity`/`account_id`/`event`/
+  `contains`/`payload`/`created_at`) could not be pulled from a live doc
+  page in this pass — the two specific webhook-payload URLs tried both
+  404'd. Treated as VERIFIED-by-convention (Razorpay's documented and
+  widely-referenced webhook pattern) rather than VERIFIED-by-example,
+  the same provenance distinction `config/decision_matrix.yaml` already
+  draws between its own VERIFIED and PLACEHOLDER entries.
+
+**What Razorpay's schema has no room for, and this system needs anyway**
+(`mandate_id`, `customer_id`, `merchant_category`, `cycle_id`, our own
+`customer_history`) is read from the payment entity's `notes` field,
+which Razorpay reserves for merchant-supplied key/value metadata. Real
+`notes` values are flat strings (not nested objects, per Razorpay's
+documented per-value limit), so `customer_history` travels as a
+JSON-encoded string under `notes.customer_history` — the realistic way a
+merchant would smuggle structured data through a flat-string field, not
+an invented relaxation of the constraint.
+
+**Data minimisation (P5) on the real envelope, which the flat shape never
+had to deal with:** a genuine payment entity carries `vpa`, `email`,
+`contact` — real PII. `customer_id` prefers `notes.customer_id` and
+otherwise falls back to a SHA-256 hash of whichever of the three is
+present, never the plaintext (architecture-and-security.md sec. 3.3: "Full
+VPA: Hashed", "phone/email: Tokenised reference"). Separately,
+`scrub_pii_for_storage` redacts all three out of the copy persisted as
+`Event.raw_payload` — applied *after* HMAC verification (which runs
+against Razorpay's true, unredacted bytes; the signed artifact is never
+touched) and before anything reaches disk.
+
+**A real bug this surfaced:** the adapter's first pass converted
+`created_at` (Unix epoch, UTC) to a naive UTC datetime. Every other
+timestamp in this codebase — the generator, `executor/executor.py`'s
+window-snapping, `app/config.py`'s `npci_restricted_*_hour` — is a naive
+datetime that is *implicitly IST wall-clock*. A UTC-naive conversion
+silently shifts every hour-of-day decision (NPCI window snapping, the
+congestion override) by 5.5 hours relative to everything else in the
+system. Caught by `test_flat_and_razorpay_shapes_reach_the_same_decision_logic`
+disagreeing on bucket for what should have been the identical wall-clock
+failure time; fixed by converting through IST before stripping tzinfo.
+
+Scope note: this ran measurably larger than the ~20-line estimate — real
+fidelity (verified field names), the PII scrub, and 25 + 7 tests
+(`tests/test_razorpay_adapter.py`, new cases in `tests/test_api.py`)
+pushed it past a quick unwrapper. Flagging the overshoot rather than
+letting it pass silently; the interesting properties of the endpoint
+(HMAC over raw bytes, dedupe, fail-closed classification) are unchanged
+either way, exactly as anticipated in Phase 7's original note.
+
+180 tests total (was 147), all green.
+
+### The LLM path ships on templates
+
+No `ANTHROPIC_API_KEY` is available in this environment. M7 is fully
+built and tested against real failure modes (connection errors, timeouts,
+empty responses, no client configured — see `tests/test_explain.py`), but
+the live demo runs entirely on the deterministic template fallback: every
+explanation in every run comes from `explain/templates.py`, not from
+Claude. Stated plainly in the README's intro rather than left to be
+discovered — this is the honest state of the shipped build, and M7's
+design point is precisely that this makes no difference to what the
+system decides or how complete its audit trail is.
+
+No further time spent on the LLM path per instruction — `explain/explain.py`
+and `explain/demo.py` are unchanged from Phase 7.

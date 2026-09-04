@@ -1,18 +1,13 @@
 """Request/response shapes for the API surface (PRD sec. 8).
 
-The webhook accepts the FLAT `FailureEvent` shape defined in PRD sec. 6 --
+`FailureEventIn` is the FLAT `FailureEvent` shape defined in PRD sec. 6 --
 the same dict the generator emits and every module downstream already
-consumes -- not Razorpay's nested
-`{"event": ..., "payload": {"payment": {"entity": {...}}}}` envelope.
-
-Deliberate, and worth stating plainly rather than letting a judge find
-it: the PRD calls this a "Razorpay-shaped payload" but then defines the
-payload itself as the flat model, and that flat model is the project's
-single contract. Adding an envelope-unwrapping adapter would be about
-twenty lines and zero insight; the interesting properties of this
-endpoint -- constant-time HMAC over the raw body, dedupe on event_id,
-fail-closed classification -- are identical either way. Flagged in
-DECISIONS.md as a known gap, not presented as done.
+consumes. It is also the TARGET shape everything else gets mapped onto:
+`app/razorpay_adapter.py` builds a `FailureEventIn` from Razorpay's real
+nested webhook envelope (`{"event": ..., "payload": {"payment": {"entity":
+{...}}}}`), and the webhook handler accepts either shape on the wire --
+see app/api.py's `webhook_payment_failed` and DECISIONS.md, "Razorpay
+envelope adapter".
 """
 
 from datetime import datetime

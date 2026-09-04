@@ -27,6 +27,12 @@ from app.config import settings
 from app.database import get_db
 from app.ingest import decide, load_or_open_mandate_state, persist_event
 from app.models import Decision, Event, SimulationRun
+from app.razorpay_adapter import (
+    RazorpayEnvelopeError,
+    from_razorpay_envelope,
+    looks_like_razorpay_envelope,
+    scrub_pii_for_storage,
+)
 from app.runner import run_simulation, seed_batch
 from app.schemas import FailureEventIn, ResetIn, SimulateRunIn
 from app.security import verify_webhook_signature
@@ -35,8 +41,13 @@ from explain.explain import attach_explanations
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Razorpay's own header name for the webhook HMAC.
+# Razorpay's own header names -- verified via WebFetch against
+# razorpay.com/docs/webhooks/validate-test/ (2026-09-04). The signature
+# header was already assumed correctly; the idempotency header
+# (`x-razorpay-event-id`, "unique per event") is new information from
+# that pass -- see app/razorpay_adapter.py.
 SIGNATURE_HEADER = "X-Razorpay-Signature"
+EVENT_ID_HEADER = "X-Razorpay-Event-Id"
 
 
 def _matrix(request: Request):
@@ -74,8 +85,21 @@ async def webhook_payment_failed(
     request: Request,
     db: Session = Depends(get_db),
     x_razorpay_signature: str | None = Header(default=None, alias=SIGNATURE_HEADER),
+    x_razorpay_event_id: str | None = Header(default=None, alias=EVENT_ID_HEADER),
 ):
     """Ingest one failure event.
+
+    Accepts EITHER of two body shapes, both signed and dispatched the same
+    way -- the envelope choice only affects step 3.5 below:
+
+      - Razorpay's REAL webhook envelope (`{"event": "payment.failed",
+        "payload": {"payment": {"entity": {...}}}, ...}`) -- what a live
+        Razorpay integration actually sends. See app/razorpay_adapter.py.
+      - The flat `FailureEventIn` shape from PRD sec. 6 -- what the
+        synthetic generator emits and every internal module already
+        consumes. Kept working because it is simpler to drive from tests
+        and the demo script, and because "flat internal shape" is still
+        this project's single contract everywhere past this endpoint.
 
     Order is load-bearing and matches architecture-and-security.md
     sec. 3.1-3.2 exactly:
@@ -87,11 +111,16 @@ async def webhook_payment_failed(
          PARSING. An unsigned payload never reaches the parser, so a
          malformed-JSON attack surface simply isn't reachable without the
          shared secret.
-      3. Dedupe on `event_id`. A duplicate returns 200 with the ORIGINAL
+      3. Parse, then detect which of the two shapes this is and map it
+         onto the one internal `FailureEventIn` contract.
+      4. Dedupe on `event_id`. A duplicate returns 200 with the ORIGINAL
          decision -- never an error. Razorpay retries anything it thinks
          failed, so a 500 here causes a redelivery storm.
-      4. Persist, decide, and commit in one transaction.
-      5. THEN explain, in a guard that cannot affect any of the above.
+      5. Persist, decide, and commit in one transaction. For a real
+         Razorpay envelope, the copy persisted as `raw_payload` has
+         vpa/email/contact redacted first (P5) -- verification in step 2
+         already ran against the true, unredacted bytes.
+      6. THEN explain, in a guard that cannot affect any of the above.
     """
     started = time.perf_counter()
 
@@ -109,10 +138,20 @@ async def webhook_payment_failed(
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="malformed_json")
 
-    try:
-        parsed = FailureEventIn.model_validate(payload)
-    except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors(include_url=False))
+    stored_raw_body = raw_body
+    if looks_like_razorpay_envelope(payload):
+        try:
+            parsed = from_razorpay_envelope(payload, x_razorpay_event_id)
+        except RazorpayEnvelopeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors(include_url=False))
+        stored_raw_body = scrub_pii_for_storage(raw_body)
+    else:
+        try:
+            parsed = FailureEventIn.model_validate(payload)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors(include_url=False))
 
     event = parsed.to_event_dict()
 
@@ -134,7 +173,7 @@ async def webhook_payment_failed(
             "ack_latency_ms": round((time.perf_counter() - started) * 1000, 2),
         }
 
-    persist_event(db, event, raw_body)
+    persist_event(db, event, stored_raw_body)
     state = load_or_open_mandate_state(db, event)
     decision = decide(db, event, _matrix(request), state)
 

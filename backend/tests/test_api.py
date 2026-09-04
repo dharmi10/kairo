@@ -45,7 +45,7 @@ def make_payload(**overrides) -> dict:
     return payload
 
 
-def post_webhook(client, payload: dict, secret: str | None = None, signature: str | None = None):
+def post_webhook(client, payload: dict, secret: str | None = None, signature: str | None = None, event_id_header: str | None = None):
     """Signs the EXACT bytes that are sent. Building the body once and
     signing that same object is the whole point -- a helper that
     re-serialised between signing and sending would silently test nothing
@@ -54,7 +54,54 @@ def post_webhook(client, payload: dict, secret: str | None = None, signature: st
     if signature is None:
         signature = sign_webhook_body(body, secret or settings.webhook_shared_secret)
     headers = {SIGNATURE_HEADER: signature, "Content-Type": "application/json"} if signature else {}
+    if event_id_header is not None:
+        headers["X-Razorpay-Event-Id"] = event_id_header
     return client.post("/webhook/payment-failed", content=body, headers=headers)
+
+
+def make_razorpay_envelope(**entity_overrides) -> dict:
+    """A real Razorpay `payment.failed` webhook body -- see
+    tests/test_razorpay_adapter.py for the field-by-field mapping tests;
+    these exercise the same envelope through the actual endpoint."""
+    entity = {
+        "id": "pay_api_rzp_1",
+        "entity": "payment",
+        "amount": 49900,
+        "currency": "INR",
+        "status": "failed",
+        "method": "upi",
+        "vpa": "someone@exampleupi",
+        "email": "someone@example.com",
+        "contact": "+919000090000",
+        "notes": {
+            "mandate_id": "mandate_api_rzp_1",
+            "customer_id": "cust_api_rzp_1",
+            "merchant_category": "OTT",
+            "customer_history": json.dumps(
+                {
+                    "prior_failures_90d": 1,
+                    "prior_insufficient_funds_90d": 0,
+                    "typical_credit_day": 20,
+                    "mandate_age_days": 200,
+                }
+            ),
+        },
+        "error_code": "GATEWAY_ERROR",
+        "error_description": "Technical error at the gateway.",
+        "error_source": "gateway",
+        "error_step": "payment_authorization",
+        "error_reason": "gateway_technical_error",
+        "created_at": 1755250800,
+    }
+    entity.update(entity_overrides)
+    return {
+        "entity": "event",
+        "account_id": "acc_test",
+        "event": "payment.failed",
+        "contains": ["payment"],
+        "payload": {"payment": {"entity": entity}},
+        "created_at": 1755250800,
+    }
 
 
 # --- webhook: authentication ----------------------------------------------
@@ -298,6 +345,146 @@ def test_decision_is_identical_with_and_without_the_explanation_layer(client, mo
     compared = ("classified_bucket", "confidence", "signals", "policy_verdict", "policy_reasons", "action",
                 "scheduled_for", "window_snapped", "outcome")
     assert {k: with_explanations[k] for k in compared} == {k: without[k] for k in compared}
+
+
+# --- webhook: the real Razorpay envelope ------------------------------------
+
+
+def test_real_razorpay_envelope_is_accepted_and_decided(client):
+    """The same endpoint, signed the same way, carrying the shape a live
+    Razorpay integration actually sends."""
+    response = post_webhook(client, make_razorpay_envelope(), event_id_header="evt_rzp_1")
+    assert response.status_code == 200
+
+    body = response.json()
+    assert body["duplicate"] is False
+    assert body["event_id"] == "evt_rzp_1"
+    decision = body["decision"]
+    assert decision["classified_bucket"] in ("B1_CONGESTION", "B3_TRANSIENT")  # gateway_technical_error's two paths
+    assert decision["action"] in ("RETRY_SCHEDULED", "HUMAN_QUEUE")
+
+    db = SessionLocal()
+    try:
+        event = db.get(Event, "evt_rzp_1")
+        assert event.mandate_id == "mandate_api_rzp_1"
+        assert event.amount_inr == 499  # 49900 paise -> 499 rupees
+        assert event.error_reason == "gateway_technical_error"
+    finally:
+        db.close()
+
+
+def test_real_razorpay_envelope_signature_still_verifies_against_raw_bytes(client):
+    """The adapter changes how the body is INTERPRETED, not how it's
+    AUTHENTICATED -- HMAC verification runs before the shape is even
+    sniffed, exactly as for the flat payload."""
+    body = json.dumps(make_razorpay_envelope()).encode()
+    response = client.post(
+        "/webhook/payment-failed",
+        content=body,
+        headers={SIGNATURE_HEADER: "0" * 64, "X-Razorpay-Event-Id": "evt_rzp_bad_sig"},
+    )
+    assert response.status_code == 401
+
+
+def test_razorpay_envelope_missing_mandate_id_gets_422_not_500(client):
+    envelope = make_razorpay_envelope()
+    del envelope["payload"]["payment"]["entity"]["notes"]["mandate_id"]
+    response = post_webhook(client, envelope, event_id_header="evt_rzp_bad")
+    assert response.status_code == 422
+
+
+def test_razorpay_envelope_idempotency_key_is_the_header_not_a_body_field(client):
+    """Razorpay's real dedupe key (architecture-and-security.md sec. 3.2)
+    is the `X-Razorpay-Event-Id` header, confirmed against Razorpay's own
+    docs -- there is no `event_id` field anywhere in a real payment
+    entity. Two deliveries of the identical body with the SAME header
+    must dedupe; two different bodies would need two different header
+    values in reality, since Razorpay mints one event id per event."""
+    envelope = make_razorpay_envelope()
+
+    first = post_webhook(client, envelope, event_id_header="evt_rzp_dupe")
+    second = post_webhook(client, envelope, event_id_header="evt_rzp_dupe")
+
+    assert first.json()["duplicate"] is False
+    assert second.json()["duplicate"] is True
+    assert [d["decision_id"] for d in second.json()["decisions"]] == [first.json()["decision"]["decision_id"]]
+
+    db = SessionLocal()
+    try:
+        assert db.query(Event).filter(Event.event_id == "evt_rzp_dupe").count() == 1
+        assert db.query(Attempt).count() <= 1
+    finally:
+        db.close()
+
+
+def test_razorpay_envelope_persists_vpa_email_contact_redacted(client):
+    """P5: the durable copy of the webhook body must never carry
+    plaintext vpa/email/contact, even though the bytes Razorpay actually
+    signed (and that were verified) did."""
+    post_webhook(client, make_razorpay_envelope(), event_id_header="evt_rzp_pii")
+
+    db = SessionLocal()
+    try:
+        event = db.get(Event, "evt_rzp_pii")
+        stored = json.loads(event.raw_payload)
+        entity = stored["payload"]["payment"]["entity"]
+        assert entity["vpa"] == "[redacted]"
+        assert entity["email"] == "[redacted]"
+        assert entity["contact"] == "[redacted]"
+        assert "someone@exampleupi" not in event.raw_payload
+        assert "someone@example.com" not in event.raw_payload
+    finally:
+        db.close()
+
+
+def test_razorpay_envelope_customer_id_never_stores_the_raw_vpa(client):
+    envelope = make_razorpay_envelope()
+    del envelope["payload"]["payment"]["entity"]["notes"]["customer_id"]
+    post_webhook(client, envelope, event_id_header="evt_rzp_hash")
+
+    db = SessionLocal()
+    try:
+        event = db.get(Event, "evt_rzp_hash")
+        assert event.customer_id.startswith("cust_")
+        assert "someone" not in event.customer_id
+    finally:
+        db.close()
+
+
+def test_flat_and_razorpay_shapes_reach_the_same_decision_logic(client):
+    """Same reason code, same timing, same history -- through either
+    wire shape -- must classify to the same bucket. The adapter's job is
+    translation, not a second decision path."""
+    flat = post_webhook(client, make_payload(event_id="evt_shape_flat", payment_id="pay_shape_flat", mandate_id="mandate_shape_flat"))
+    envelope = post_webhook(
+        client,
+        make_razorpay_envelope(
+            id="pay_shape_rzp",
+            # 2026-08-15T11:00:00 IST as Unix epoch seconds -- the exact
+            # same wall-clock instant as the flat payload's failed_at
+            # above. The adapter converts created_at (UTC epoch) to IST
+            # before anything downstream sees it (see app/razorpay_adapter.py);
+            # a UTC-naive conversion would land 5.5h off and disagree on
+            # whether this failure was inside the NPCI restricted window.
+            created_at=1786771800,
+            notes={
+                "mandate_id": "mandate_shape_rzp",
+                "customer_id": "cust_shape_rzp",
+                "customer_history": json.dumps({
+                    "prior_failures_90d": 1,
+                    "prior_insufficient_funds_90d": 0,
+                    "typical_credit_day": 20,
+                    "mandate_age_days": 200,
+                }),
+            },
+        ),
+        event_id_header="evt_shape_rzp",
+    )
+
+    flat_decision = flat.json()["decision"]
+    envelope_decision = envelope.json()["decision"]
+    for key in ("classified_bucket", "action", "policy_verdict", "window_snapped"):
+        assert flat_decision[key] == envelope_decision[key]
 
 
 # --- simulate / results / audit / reset ------------------------------------
