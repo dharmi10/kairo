@@ -113,16 +113,3 @@ frontend/              React + Vite + Recharts dashboard
 docs/                  original planning docs + docs/ASSUMPTIONS.md
 ```
 
-## Built vs. designed
-
-Everything above is built and tested. **Designed, not built in 48
-hours** (`docs/architecture-and-security.md` sec. 3.5/4.1): per-merchant
-rate limiting, webhook replay protection, and the async queue between a
-webhook ACK and its decision — straightforward extensions of what's
-here, not attempted in this window.
-
----
-
-See [`DECISIONS.md`](DECISIONS.md) for every design decision, every
-divergence from the planning docs in `docs/`, and every bug found during
-the build, in chronological order.
