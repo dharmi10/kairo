@@ -1,0 +1,102 @@
+/* Design tokens -- the reference palette from the dataviz skill
+   (references/palette.md), unmodified. Agent/baseline are assigned
+   categorical slots 1/2 (identity: two named things being compared, not
+   a magnitude ramp); outcome badges use the fixed status palette
+   (never themed, never reused for a series). Both a light and a dark
+   value are given for every token; the dark block only overrides what
+   changes, guarded so an explicit toggle wins over the OS setting in
+   both directions. */
+
+:root {
+  color-scheme: light;
+
+  --surface-1: #fcfcfb;
+  --surface-2: #f9f9f7;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --gridline: #e1e0d9;
+  --baseline-axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.1);
+
+  --series-agent: #2a78d6; /* categorical slot 1 -- blue */
+  --series-baseline: #eb6834; /* categorical slot 2 -- orange */
+
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
+
+  --delta-good: #006300;
+  --delta-bad: #d03b3b;
+
+  --font: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --radius-card: 12px;
+  --radius-pill: 999px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    --surface-1: #1a1a19;
+    --surface-2: #0d0d0d;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --gridline: #2c2c2a;
+    --baseline-axis: #383835;
+    --border: rgba(255, 255, 255, 0.1);
+
+    --series-agent: #3987e5;
+    --series-baseline: #d95926;
+
+    --status-good: #0ca30c;
+    --status-warning: #fab219;
+    --status-serious: #ec835a;
+    --status-critical: #e66767;
+
+    --delta-good: #0ca30c;
+    --delta-bad: #e66767;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --surface-1: #1a1a19;
+  --surface-2: #0d0d0d;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+  --gridline: #2c2c2a;
+  --baseline-axis: #383835;
+  --border: rgba(255, 255, 255, 0.1);
+
+  --series-agent: #3987e5;
+  --series-baseline: #d95926;
+
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #e66767;
+
+  --delta-good: #0ca30c;
+  --delta-bad: #e66767;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--surface-2);
+  color: var(--text-primary);
+  font-family: var(--font);
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+}

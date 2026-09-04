@@ -1,0 +1,153 @@
+.headline {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  padding: 28px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.headline__top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+
+.headline__hero {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.headline__label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* The hero figure: the single largest number on the page, per M8's
+   acceptance criterion that it be visible without scrolling. >=48px per
+   the dataviz skill's figure spec; proportional (not tabular) figures at
+   display size. */
+.headline__hero-value {
+  font-size: 64px;
+  line-height: 1.05;
+  font-weight: 700;
+  font-variant-numeric: proportional-nums;
+}
+
+.headline__sub {
+  font-size: 14px;
+  color: var(--text-secondary);
+}
+
+.delta--good {
+  color: var(--delta-good);
+}
+.delta--bad {
+  color: var(--delta-bad);
+}
+
+.run-button {
+  background: var(--series-agent);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  padding: 12px 22px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.run-button:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.run-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.headline__row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.stat-tile {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.stat-tile--range {
+  border-style: dashed;
+}
+
+.stat-tile__label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.stat-tile__value {
+  font-size: 24px;
+  font-weight: 700;
+  font-variant-numeric: proportional-nums;
+}
+
+.stat-tile__value--range {
+  font-size: 19px;
+}
+
+.stat-tile__sub {
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+.headline--empty {
+  align-items: center;
+  flex-direction: row;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+
+.headline__empty-copy h1 {
+  margin: 0 0 6px;
+  font-size: 28px;
+}
+
+.headline__empty-copy p {
+  margin: 0;
+  color: var(--text-secondary);
+  max-width: 56ch;
+}
+
+.headline__error {
+  color: var(--status-critical);
+  font-weight: 600;
+  margin-top: 8px !important;
+}
+
+.run-button--empty {
+  flex-shrink: 0;
+}
+
+@media (max-width: 860px) {
+  .headline__row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .headline__hero-value {
+    font-size: 48px;
+  }
+}

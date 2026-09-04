@@ -1,0 +1,23 @@
+{
+  "name": "kairo-dashboard",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "sync:fixture": "node scripts/sync-fixture.mjs",
+    "predev": "npm run sync:fixture",
+    "dev": "vite",
+    "prebuild": "npm run sync:fixture",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "recharts": "2.15.4"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "4.7.0",
+    "vite": "5.4.21"
+  }
+}

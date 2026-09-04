@@ -7,3 +7,9 @@ venv/
 node_modules/
 frontend/dist/
 .pytest_cache/
+
+# Synced from backend/metrics/output/multi_seed_range.json by
+# frontend/scripts/sync-fixture.mjs (runs automatically before `npm run
+# dev`/`build`) -- that backend file is the committed source of truth;
+# this is a build-time copy, not a second one to keep in sync by hand.
+frontend/public/multi_seed_range.json

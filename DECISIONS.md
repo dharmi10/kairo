@@ -1433,3 +1433,175 @@ system decides or how complete its audit trail is.
 
 No further time spent on the LLM path per instruction — `explain/explain.py`
 and `explain/demo.py` are unchanged from Phase 7.
+
+## 2026-09-04 — Phase 8: the dashboard (M8)
+
+`frontend/` — React 18.3.1 + Vite 5.4.21 + Recharts 2.15.4, per the PRD
+tech stack table. All four M8 sections built: headline strip, bucket
+comparison chart, governance panel, audit trail (with search and
+expand). Loads from the API — the one exception is the 20-seed fixture,
+per the user's explicit carve-out.
+
+### Version pins: 2.x/18.x, not the just-released 3.x/19.x majors
+
+`npm view` showed React 19.2.8, Recharts 3.10.1, Vite 8.2.2 as latest at
+build time. Deliberately pinned one major back on each
+(`react`/`react-dom` 18.3.1, `recharts` 2.15.4, `vite` 5.4.21,
+`@vitejs/plugin-react` 4.7.0) rather than the newest available. Reasoning
+stated plainly rather than left implicit: this assistant's confidence in
+Recharts' exact 3.x API surface (props, event shapes) is materially lower
+than in 2.x's, which is extensively represented in training data, and a
+buildathon demo has zero tolerance for a chart silently failing to
+render on an API a subagent got half-right. React 18's function-component
+API (hooks, JSX) is unchanged in any way that matters here even under
+19, so that pin cost nothing; Vite 5 vs 8 similarly. This is a
+reliability-over-recency tradeoff, made once and stated once — not
+evidence of avoiding new tooling generally.
+
+### The headline is recovery-rate delta, not ₹ recovered — implementing the prior revision
+
+This was already decided in the Phase-6-era DECISIONS.md entry ("M8
+dashboard spec, finalized") on the multi-seed evidence: recovery rate
+holds in a comparatively tight 12.0–18.6pt band across 20 independently-
+generated populations, while ₹-recovered uplift ranges +2.3% to +68.5%
+on the same runs (a log-normal amount tail putting a handful of
+high-value events on different sides of an otherwise-close race).
+Phase 8's job was just to build the page that spec already described:
+recovery-rate delta at 64px (the largest text on the page, satisfying
+the PRD's literal acceptance criterion), the ₹ figures shown too but
+never alone — a fourth stat tile puts the fixture's 20-seed ₹-uplift
+range directly beside the single run's ₹ delta.
+
+### The 20-seed range: a synced static asset, not a new API endpoint
+
+The user's instruction explicitly carved the fixture out of "read
+everything from the API." Two ways to honor that were available: (a) a
+tiny new `GET` endpoint that just reads and returns the committed JSON
+file, or (b) a build-time static asset the frontend fetches directly.
+Chose (b) — it's what "except the multi-seed fixture" most naturally
+reads as (the frontend consuming it directly, not through a proxy
+endpoint), and it avoids a backend surface change to serve a file that
+never changes at runtime.
+
+The obvious risk with (b) is drift: someone regenerates
+`backend/metrics/output/multi_seed_range.json` and forgets to update
+whatever the frontend was reading. Mitigated with
+`frontend/scripts/sync-fixture.mjs`, wired into `predev`/`prebuild` in
+`package.json` — every `npm run dev` or `npm run build` re-copies the
+file fresh, so there is no separate "sync the fixture" step for anyone
+to remember or skip. The copied file lives in `frontend/public/`,
+gitignored (the backend file is the one committed source of truth; a
+tracked duplicate would be two files claiming to be canonical).
+
+### Escalated-to-human count: a filtered `/audit` total, not a new metric
+
+`compute_metrics` (backend, Phase 6) reports outcome-based aggregates
+(recovered/failed/pending), not policy-verdict or action counts — there
+was never a "how many decisions escalated" number anywhere in
+`/results/summary` or `/results/by-bucket`. Rather than add a new
+backend metric for one governance-panel tile, the dashboard reads it
+from `GET /audit?action=HUMAN_QUEUE&limit=1` and uses the response's
+`total` — the paginated endpoint already computes a full-filter count
+before slicing to `limit`, so this is one cheap indexed-column query,
+not a fetch-everything-and-count-in-JS.
+
+### Kept audit search + expand; the brief allowed cutting them
+
+The user pre-authorized dropping search/expand if time ran short,
+asking to be told rather than have it happen silently. Not cut, and
+here's why stated rather than left implicit: `GET /audit`'s row shape
+(`app/api.py::_decision_summary`, built in Phase 7) already returns
+`signals`, `policy_reasons`, `explanation`, `explanation_source`,
+`confidence`, and `scheduled_for` on every row — everything an expanded
+row needs. Expand-in-place therefore costs zero additional requests; it
+is a CSS/state feature over data already on the page, not a new backend
+round trip per row (which is what would have made it expensive). Search
+and the four filter dropdowns are the same story — plain query params
+the endpoint has accepted since Phase 7. What line-item time actually
+would have gone toward, and was left out instead: column sorting (table
+is fixed newest-first, matching the API's own default order) and a CSV
+export button. Neither is in the PRD's M8 acceptance criteria.
+
+### Dataviz skill applied, not skipped
+
+Loaded before writing chart code, per the trigger rule. Two-series
+comparison (agent/baseline) is identity, not magnitude, so categorical
+color — palette slots 1/2 (blue/orange), the same pair reused for every
+agent-vs-baseline contrast in the dashboard so the mapping is learned
+once. Validated against both surfaces before use:
+`node scripts/validate_palette.js "#2a78d6,#eb6834" --mode light` and
+the dark pair (`#3987e5,#d95926` on `#1a1a19`) — both clear every gate
+(worst adjacent CVD ΔE 24.7/26.8, well above the >=8 target; worst
+adjacent normal-vision ΔE 33.6/31.8, above the >=15 floor). Outcome
+badges use the FIXED status palette (never themed, never reused for a
+series) with icon+label pairing, since `warning`/`serious` are
+documented sub-3:1 on the light surface by design — a darker readable
+step stands in for the raw token on light, the dark surface uses the
+token directly. Bars are ≤24px with a 4px rounded data-end; the audit
+table itself doubles as the accessibility-required "table view" for
+every value the chart and stat tiles show, so nothing is chart-only.
+
+### CORS
+
+Added `CORSMiddleware` to `backend/app/main.py`, scoped to
+`localhost:5173` / `127.0.0.1:5173` (the Vite dev server's default
+origins) rather than `"*"` — this demo has no cookie-based auth to
+protect, but there's no reason to advertise an open policy either.
+Flagged in the code comment as needing widening (or an env-driven
+allowlist) before the frontend is ever deployed anywhere but a
+developer's own machine.
+
+### The button never fires on load
+
+`App.jsx` fetches `/results/summary` and `/results/by-bucket` on mount
+so a page refresh during a demo shows whatever the backend last
+computed (`SimulationRun` rows persist across restarts, Phase 7) rather
+than an empty dashboard — but it never calls `POST /simulate/run`
+itself. Considered auto-triggering a live run on a fresh DB so the
+acceptance criterion ("renders with real generated data") is satisfied
+with zero clicks; rejected because `/simulate/run` is a mutating,
+DB-clearing call, and firing it automatically on every page load — worse,
+twice under React 18 StrictMode's dev-mode double-invoke — is a bigger
+side effect than a demo page should spring on whoever opens it. The
+empty state instead shows a clear, large "Run simulation" CTA in the
+headline strip's own position, so the button is still the visible,
+obvious next action without an unrequested POST firing behind it.
+
+### Tests, and what actually got verified
+
+No frontend unit-test suite was added — the PRD's M8 acceptance criteria
+("loads from the API, renders with real data, headline visible without
+scrolling") are about the running page, not unit-testable component
+logic in isolation, and the backend's 180 tests already cover every
+number the dashboard displays.
+
+What WAS done instead of skipping verification: `npm run build` (catches
+every import/prop-shape error a unit test would too, for a page this
+size — 843 modules, clean), then both servers were actually launched
+(`uvicorn` on :8000, `vite` on :5173, CORS-connected) and driven end to
+end through a real Chrome instance (the `claude-in-chrome` tool) —
+empty state, "Run simulation" click, the full 500-event/801-decision
+live run, the bucket chart, all four governance tiles, audit row
+expand, and an outcome filter (`Recovered` → 270 rows, matching the
+backend's own `n_recovered`). Console was clean on a fresh page load
+(no React/Recharts warnings, no fetch errors) both before and after the
+run. Confirmed CORS headers are actually returned correctly for the dev
+origin (`curl -i -X OPTIONS ... -H "Origin: http://localhost:5173"` →
+`access-control-allow-origin: http://localhost:5173`), not just
+configured and hoped-for. A page reload was also driven mid-session to
+confirm the "persisted last run" behavior actually works (it does —
+see "The button never fires on load" above).
+
+**One real bug found and fixed this way, that neither the Python test
+suite nor `npm run build` could have caught:** the audit table's last
+column header read "Decided" while the cell under it rendered
+`scheduled_for`, not `decided_at` — a copy/paste mismatch between two
+edits, invisible in source, obvious on screen. Fixed to "Scheduled for"
+(the correct, and more informative, label for a retry-scheduling
+story). Left as a case study for why "the build passed" and "the app
+was run" are different claims.
+
+Also noted, not fixed: the production JS bundle is 531KB (154KB
+gzipped), past Vite's 500KB warning threshold — mostly Recharts. Not
+worth code-splitting for a single-page buildathon demo; flagged rather
+than silently ignored.

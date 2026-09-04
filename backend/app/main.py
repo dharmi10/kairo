@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app import models  # noqa: F401  -- registers tables on Base.metadata
 from app.api import router
@@ -24,6 +25,24 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Kairo", lifespan=lifespan)
+
+# Phase 8: the frontend dashboard (Vite dev server, default
+# http://localhost:5173) is a separate origin from this API (default
+# http://127.0.0.1:8000). Scoped to localhost dev ports rather than "*" --
+# this is a demo project with no cookie-based auth to protect, but there's
+# no reason to advertise an open CORS policy either. Widen this list (or
+# read it from an env var) before ever deploying the frontend anywhere
+# other than a developer's own machine.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
 app.include_router(router)
 
 

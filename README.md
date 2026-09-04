@@ -593,8 +593,94 @@ delivery timestamp skewed more than 5 minutes — the payload carries
 `failed_at`, not a delivery time, so this needs a header we don't model)
 and **per-merchant rate limiting**.
 
-The webhook accepts the flat `FailureEvent` shape from PRD sec. 6 — the
-same dict every module already consumes — not Razorpay's nested
-`{"event": ..., "payload": {"payment": {"entity": ...}}}` envelope. The
-adapter is ~20 lines of unwrapping and changes none of the endpoint's
-interesting properties, but it isn't written.
+The webhook accepts **either** the flat `FailureEvent` shape from PRD
+sec. 6 or Razorpay's real nested webhook envelope — see "Two wire shapes,
+one internal contract" above.
+
+## The dashboard (`frontend/`)
+
+React + Vite + Recharts, per PRD tech stack table. Run it against a
+running backend (`uvicorn app.main:app --reload` from `backend/`, default
+`http://127.0.0.1:8000`):
+
+```
+cd frontend
+npm install
+npm run dev      # http://localhost:5173
+```
+
+`npm run dev` and `npm run build` both run `scripts/sync-fixture.mjs`
+first (see `predev`/`prebuild` in `package.json`) — see "The one
+non-live number" below.
+
+### Four sections, PRD M8, with the DECISIONS.md revisions applied
+
+1. **Headline strip.** Largest text on the page — visible without
+   scrolling — is the **live run's recovery-rate delta**, not ₹
+   recovered. Per the multi-seed finding (`README` "Multi-seed
+   robustness" above): recovery rate is stable across 20 independently-
+   generated populations (a 12.0–18.6pt band) while ₹ uplift swings
+   widely on the same runs. The ₹ figures are still shown — agent,
+   baseline, and the delta — but a fourth tile puts the fixture's 20-seed
+   ₹-uplift *range* directly beside them, so the single-run ₹ number is
+   never presented alone as though it were a fixed, precise claim.
+2. **Comparison chart.** Recharts grouped bar, recovery rate % by bucket,
+   agent vs. baseline. Two named series → categorical color (agent =
+   palette slot 1 blue, baseline = slot 2 orange), the same pair used
+   everywhere else in the dashboard. Validated against the dataviz
+   skill's CVD/contrast gates before use (`node
+   scripts/validate_palette.js "#2a78d6,#eb6834" --mode light`, and the
+   dark pair — both pass every check).
+3. **Governance panel.** Wasted attempts avoided, hard declines correctly
+   suppressed (of N B5 events, 0 auto-retried — the number M4's tests
+   already guarantee is always 0), customer contacts sent, and items
+   escalated to a human. Every number is read straight off
+   `/results/summary`, `/results/by-bucket`, or one filtered `/audit`
+   count (`?action=HUMAN_QUEUE&limit=1`, whose `total` is the escalation
+   count without fetching every row) — nothing computed client-side
+   beyond the subtraction the API already did for
+   `delta.wasted_attempts_avoided`.
+4. **Audit trail table.** Paginated (20/page), filterable (bucket,
+   action, verdict, outcome, and a decision/event-id substring search),
+   and expandable per row to show signals, policy reasons, confidence,
+   and the explanation with its provenance (`llm` / `template`). Kept
+   both search and expand rather than cutting them — the brief allowed
+   dropping them under time pressure, but `GET /audit` already returns
+   every field a row needs (see `app/api.py::_decision_summary`), so
+   expand costs zero extra requests and the filters are query params the
+   endpoint already accepted from Phase 7. Neither one was the expensive
+   part of M8. What actually got simplified instead: no sort-by-column
+   (fixed newest-first, matching the API's own ordering) and no CSV
+   export.
+
+### "Run simulation" does one live run; the 20-seed range never does
+
+The button calls `POST /simulate/run` exactly once per click — a fresh
+500-event batch, decided, measured, persisted. The 20-seed range shown
+beside the headline is **never** recomputed by this button or by
+anything else in the dashboard; it is read from a static asset.
+
+### The one non-live number
+
+Per DECISIONS.md ("M8 dashboard: precomputed fixture, not a live sweep
+endpoint"), the 20-seed range is committed context, not something a
+button should ever trigger — running it live would mean 20 full
+500-event simulations (all of `backend/metrics/multi_seed.py`) on every
+click, and it would make the "stable" claim itself re-computed on
+demand, undermining the point of citing it as a fixed, already-audited
+number.
+
+`frontend/scripts/sync-fixture.mjs` copies
+`backend/metrics/output/multi_seed_range.json` into `frontend/public/`
+before every `dev`/`build`, so the copy can't go silently stale — there
+is no separate manual step to forget, and regenerating the backend
+fixture (`python -m metrics.multi_seed`) is picked up on the next
+`npm run dev`. Every other number in the dashboard is fetched live from
+the API on load and after each run; nothing else is hardcoded.
+
+A page reload during a demo does not lose the current run: `SimulationRun`
+rows are durable (Phase 7), so the dashboard reloads whatever the backend
+last computed rather than requiring a fresh click every time. The
+"Run simulation" button's contract — one live run, on click, never
+implicit — is unaffected: nothing on mount ever calls `POST
+/simulate/run` itself.

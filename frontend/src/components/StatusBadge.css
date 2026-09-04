@@ -1,0 +1,49 @@
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: var(--radius-pill);
+  font-size: 12.5px;
+  font-weight: 600;
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.badge--good {
+  color: var(--status-good);
+}
+.badge--critical {
+  color: var(--status-critical);
+}
+.badge--warning {
+  /* warning yellow is sub-3:1 on the light surface by design
+     (palette.md) -- a darker, readable step stands in for the token on
+     light; the dark surface can use the token directly. */
+  color: #9a6a00;
+}
+:root[data-theme="dark"] .badge--warning {
+  color: var(--status-warning);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .badge--warning {
+    color: var(--status-warning);
+  }
+}
+.badge--muted {
+  color: var(--text-muted);
+}
+
+.pill {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: var(--radius-pill);
+  font-size: 12.5px;
+  font-weight: 600;
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
