@@ -55,7 +55,14 @@ class Decision(Base):
     scheduled_for: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     window_snapped: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    explanation: Mapped[str | None] = mapped_column(String, nullable=True)  # LLM-generated
+    explanation: Mapped[str | None] = mapped_column(String, nullable=True)  # M7 -- written AFTER this row commits
+    # Provenance for the line above: "llm" (Anthropic API) | "template"
+    # (deterministic fallback) | NULL (not explained yet). Not in the PRD's
+    # Decision model; added in Phase 7 because "the audit record is the
+    # product" (architecture-and-security.md sec. 6) and an auditor reading
+    # an explanation needs to know whether a model wrote it or a template
+    # did, without having to guess from the prose style.
+    explanation_source: Mapped[str | None] = mapped_column(String, nullable=True)
 
     outcome: Mapped[str] = mapped_column(String, default="NOT_ATTEMPTED")
     amount_recovered_inr: Mapped[int] = mapped_column(Integer, default=0)
@@ -106,3 +113,41 @@ class MandateState(Base):
 
     version: Mapped[int] = mapped_column(Integer, default=1)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class SimulationRun(Base):
+    """One `POST /simulate/run` execution: the seeds it used and the
+    metrics both arms produced. Append-only.
+
+    Not in the PRD's data-model section, which lists only the four tables
+    above -- added in Phase 7 because `GET /results/summary` and
+    `/results/by-bucket` have to answer "what did the last run measure?"
+    across a process restart, and the baseline arm's per-event records
+    exist nowhere else (the agent's do, as Decision rows; baseline writes
+    no decisions because it makes none). Storing the computed metrics
+    rather than 500 baseline rows keeps this to one small row per run.
+    """
+
+    __tablename__ = "simulation_runs"
+
+    run_id: Mapped[str] = mapped_column(String, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    batch_size: Mapped[int] = mapped_column(Integer)
+    batch_seed: Mapped[int] = mapped_column(Integer)
+    sim_seed: Mapped[int] = mapped_column(Integer)
+
+    agent_metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    baseline_metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    agent_by_bucket: Mapped[dict] = mapped_column(JSON, default=dict)
+    baseline_by_bucket: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    rs_uplift_pct: Mapped[float] = mapped_column(Float)
+    rate_delta_points: Mapped[float] = mapped_column(Float)
+
+    explanations_llm: Mapped[int] = mapped_column(Integer, default=0)
+    explanations_template: Mapped[int] = mapped_column(Integer, default=0)
+    explanation_api_calls: Mapped[int] = mapped_column(Integer, default=0)
+
+    engine_version: Mapped[str] = mapped_column(String)
+    matrix_version: Mapped[str] = mapped_column(String)

@@ -250,12 +250,26 @@ def execute_decision(
     policy_reasons: list[str],
     mandate_history: dict,
     matrix: DecisionMatrix,
+    mandate_state=None,
 ) -> Decision:
     """The only impure function here. Decision write + Attempt scheduling
     happen against the same Session and commit together -- if the commit
     fails, neither row persists. There is never a scheduled Attempt
     without its Decision audit record (architecture-and-security.md
-    sec. 5.2)."""
+    sec. 5.2).
+
+    `mandate_state` (Phase 7, optional): the `MandateState` row this
+    decision's counters should be advanced on. Applied HERE, before the
+    single commit, rather than by the caller afterwards -- because a
+    caller that committed the counters separately could crash in between
+    and leave a scheduled attempt that the attempt cap doesn't know about,
+    which is precisely the atomicity property sec. 5.2 asks for. Callers
+    that don't track mandate state (the in-memory batch runners in
+    executor/pipeline.py, and the unit tests) pass nothing and behave
+    exactly as before.
+
+    `explanation` is left NULL on purpose: M7 fills it in only after this
+    transaction has committed. See explain/explain.py."""
     plan = resolve_action(event, classification, policy_verdict, policy_reasons, mandate_history, matrix)
 
     decision = Decision(
@@ -269,7 +283,8 @@ def execute_decision(
         action=plan["action"],
         scheduled_for=plan["scheduled_for"],
         window_snapped=plan["window_snapped"],
-        explanation=None,  # M7, not built yet
+        explanation=None,  # M7 fills this in AFTER this transaction commits
+        explanation_source=None,
         outcome="PENDING" if plan["action"] == RETRY_SCHEDULED else "NOT_ATTEMPTED",
         amount_recovered_inr=0,
         engine_version=settings.engine_version,
@@ -288,5 +303,28 @@ def execute_decision(
         )
         db.add(attempt)
 
+    if mandate_state is not None:
+        _advance_mandate_state(mandate_state, plan, event)
+
     db.commit()
     return decision
+
+
+def _advance_mandate_state(state, plan: dict, event: dict) -> None:
+    """Mirror this decision's effect onto the mandate's mutable aggregate,
+    which is what evaluate_policy's attempt-cap / cooling-off / contact-cap
+    rules read on the NEXT event for this mandate. Mutates `state` in the
+    caller's Session; the caller commits."""
+    if plan["action"] == RETRY_SCHEDULED:
+        state.total_retry_attempts += 1
+        state.last_attempt_at = plan["scheduled_for"]
+    elif plan["action"] == NUDGE_SENT:
+        state.total_contacts_sent += 1
+        state.status = "stopped"  # a nudge is terminal for the automated cycle -- see executor/simulate.py
+    elif plan["action"] == HUMAN_QUEUE:
+        state.status = "escalated"
+    elif plan["action"] == STOPPED:
+        state.status = "stopped"
+
+    state.version += 1
+    state.updated_at = datetime.utcnow()

@@ -380,3 +380,179 @@ clearer, not smaller, going from n=5 to n=20.
 assumptions for the UPI-mandate-lifecycle events Razorpay doesn't publicly
 document a reason-code string for. See `DECISIONS.md` for the full
 verification history.
+
+## The API
+
+Seven endpoints (`backend/app/api.py`). Run the server with:
+
+```
+cd backend
+uvicorn app.main:app --reload
+```
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/webhook/payment-failed` | Ingest one failure event |
+| POST | `/simulate/run` | Run a full batch through agent + baseline |
+| GET | `/results/summary` | The five headline metrics, both arms, plus the deltas |
+| GET | `/results/by-bucket` | Per-bucket breakdown, both arms |
+| GET | `/audit` | Paginated, filterable decision log |
+| GET | `/audit/{decision_id}` | One decision, fully reconstructible |
+| POST | `/reset` | Clear the DB, regenerate the batch |
+
+### The webhook
+
+Order of operations, which is the whole security story:
+
+1. **Read the raw body.** Not the parsed JSON — re-serialising changes the
+   bytes (key order, whitespace, unicode escaping) and the signature would
+   never match again.
+2. **Verify HMAC-SHA256 with `hmac.compare_digest`**, and **reject before
+   parsing**. A plain `==` leaks timing information; parsing an unsigned
+   payload hands an attacker a parser they haven't authenticated to.
+3. **Dedupe on `event_id`.** A duplicate returns `200` with the
+   *original* decision, never an error — Razorpay retries anything it
+   thinks failed, so a 500 here causes a redelivery storm. This is
+   idempotency layer 1; layer 2 is the `UNIQUE (mandate_id, cycle_id,
+   retry_attempt_number)` constraint on `attempts`, which makes a
+   duplicate debit attempt structurally impossible even if layer 1 is
+   bypassed.
+4. **Persist, decide, and commit in one transaction** — the raw event,
+   the `Decision` audit record, any scheduled `Attempt`, and the advanced
+   `MandateState` counters. All of it, or none of it. There is never a
+   scheduled attempt without its audit record.
+5. **Then explain** (see below), in a guard that cannot affect any of the
+   above.
+
+The response reports `ack_latency_ms` — the span from request arrival to
+the durable decision, which is what
+[`architecture-and-security.md`](architecture-and-security.md)'s < 150 ms
+budget applies to — separately from `explanation_latency_ms`. In this
+build the explanation runs inside the request, so the client waits for
+both; moving it behind a queue changes the response time and nothing else.
+
+The mandate state is **durable**, so the policy engine's attempt cap,
+cooling-off floor and contact limit hold across separate HTTP requests,
+not just within one in-process simulation.
+
+`POST /reset` regenerates the batch as **raw events only** — no decisions,
+no metrics. `POST /simulate/run` clears, decides, and measures. They are
+deliberately distinct: `/results/summary` reports *the* last run, and
+blending two batches' numbers would be worse than a resettable demo DB.
+
+## The explanation layer (M7)
+
+`python -m explain.demo` runs the whole thing and prints the evidence for
+each claim below.
+
+**The LLM never makes a decision. It writes a sentence about a decision
+that has already been committed.** That is not a convention this codebase
+follows carefully; it is a property of how the code is arranged:
+
+- `executor/`, `policy/` and `classifier/` **do not import `explain`** —
+  asserted by a test that walks their ASTs, so it stays true;
+- every entry point in `explain/` takes a `Decision` row that is already
+  durable;
+- the layer writes exactly two columns, `explanation` and
+  `explanation_source`. It cannot change a bucket, a verdict, an action, a
+  schedule or an outcome, because it never writes those columns;
+- the single call site catches every exception and rolls back only the
+  explanation transaction.
+
+Delete the entire `explain/` package and every decision the system makes
+is byte-identical. There is a test for that too.
+
+> **The async boundary is designed, not built.**
+> `architecture-and-security.md` sec. 4.1 describes a background worker
+> filling `explanation` in after the fact. That queue is *not*
+> implemented — the call runs synchronously right after the decision
+> commit. The four properties above are what make it safe, and they hold
+> identically whether the call happens 1 ms or 1 hour later. The queue is
+> a latency optimisation, not the safety mechanism.
+
+### No PII reaches the prompt
+
+`FORBIDDEN_IN_PROMPT = {"customer_id", "vpa", "phone", "email",
+"payment_id"}`, plus `amount_inr`, `mandate_id`, `event_id` and
+`customer_history` on the same data-minimisation principle. Enforced in
+two layers:
+
+- the field-name filter from the architecture doc, kept verbatim;
+- a **value-level scan of the rendered prompt string**, which is the layer
+  that can actually fire — it catches a customer id that reached the
+  prompt *inside an allowed field* (a signal string, a badly templated
+  label), which a field-name filter structurally cannot see. It raises
+  `PIILeakError`, an exception rather than an `assert`, because `assert`
+  is compiled out under `python -O` and a control that vanishes under an
+  optimisation flag is not a control.
+
+`PIILeakError` is the one failure the layer does **not** swallow into the
+template fallback. A leak is our bug, not a dependency being down.
+
+The demo prints the exact prompt so the claim can be checked by reading it
+rather than believing it.
+
+### The prompt is narrower than the PRD's sketch — on purpose
+
+The PRD asks for a prompt carrying the reason code, confidence, signals
+and scheduled time, *and* for caching by `(bucket, action,
+policy_verdict)`. Those are in conflict: all four of those fields vary
+between decisions that share a cache key, so a cached sentence naming any
+of them would state something **false** about the other decisions it gets
+attached to — fabricated content in an append-only audit record.
+
+So the prompt carries only the cache key and things derived from it. A
+test asserts that two contexts sharing a key render byte-identical
+prompts. The specifics aren't lost: they're in the audit record's own
+structured fields, and the *template* path — rendered per decision, never
+cached — does name the exact snapped retry time and the rules that fired.
+
+### The cache
+
+Measured on the seed-42, 500-event run:
+
+| | |
+|---|---|
+| decisions written | 801 |
+| distinct `(bucket, action, policy_verdict)` | 23 |
+| API calls | 23 |
+| calls avoided by the cache | 778 (97%) |
+
+Widening the key to include the reason code and signals would take 23
+distinct keys to 91 — still far from 801. It is a one-line change to
+`CACHE_KEY_FIELDS` if the extra specificity is ever wanted.
+
+### The fallback
+
+Any failure — no API key, network down, timeout, rate limit, or a 200 that
+came back with no usable text — returns a deterministic template sentence
+instead. `python -m explain.demo` proves it by injecting a client that
+raises `anthropic.APIConnectionError` on every call: 60 decisions, 60
+templates, **zero empty explanations**. The demo must never break because
+of a network error, and the audit record must never carry a blank
+rationale.
+
+Every explanation stores its provenance in `Decision.explanation_source`
+(`llm` | `template`), so an auditor never has to infer it from prose
+style.
+
+> **The repo ships no API key**, so out of the box every explanation comes
+> from the template path and zero API calls are made. `python -m
+> explain.demo` exercises the LLM code path against a **stub whose
+> sentences are hardcoded in `explain/demo.py`**, and says so in capitals
+> every time it runs. For a genuine model-written sample, set
+> `ANTHROPIC_API_KEY` and re-run. Stub output is not model output.
+
+### What isn't built
+
+Two controls from `architecture-and-security.md` sec. 3.5 remain
+[DESIGN]-only and are not implemented: **replay protection** (rejecting a
+delivery timestamp skewed more than 5 minutes — the payload carries
+`failed_at`, not a delivery time, so this needs a header we don't model)
+and **per-merchant rate limiting**.
+
+The webhook accepts the flat `FailureEvent` shape from PRD sec. 6 — the
+same dict every module already consumes — not Razorpay's nested
+`{"event": ..., "payload": {"payment": {"entity": ...}}}` envelope. The
+adapter is ~20 lines of unwrapping and changes none of the endpoint's
+interesting properties, but it isn't written.

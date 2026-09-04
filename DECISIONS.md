@@ -1144,3 +1144,200 @@ No Python 3.11 installed on this machine. `py -0p` listed a 3.13, but its
 registered path (`OneDrive\Desktop\python.exe`) is broken — not a real
 interpreter, venv creation fails against it. Using **3.10** for the backend
 venv; nothing in the spec depends on a 3.11-only language feature.
+
+## 2026-09-04 — Phase 7: API surface + M7 explanation layer
+
+All seven PRD sec. 8 endpoints are built (`app/api.py`), plus M7
+(`explain/`). 44 new tests, 147 total, all green. `python -m
+executor.pipeline`, `python -m metrics.report` and `python -m
+metrics.multi_seed` are unchanged in output — the multi-seed fixture
+regenerates byte-identically, which is the check that Phase 7 didn't
+perturb the simulation.
+
+### The explanation prompt is narrower than the PRD's sketch — deliberately
+
+PRD sec. M7 specifies two things that cannot both be true:
+
+- a prompt carrying `reason`, `confidence`, `signals[]` and
+  `scheduled_for`;
+- caching by `(bucket, action, policy_verdict)`.
+
+Every one of those four fields **varies between decisions that share that
+cache key**. A sentence generated for one decision and then reused across
+the key would state a retry time, a confidence, or a reason code that is
+simply false for the other decisions it gets attached to. That is
+fabricated content in an append-only audit record — the one failure mode
+this system cannot have.
+
+**Resolution: the prompt carries only the cache key and things derived
+from it** (the bucket's `label` and `class`, read from the matrix).
+Enforced by a test, not just by care —
+`test_prompt_carries_nothing_beyond_the_cache_key` builds two contexts
+that share a key but differ in every other field and asserts the rendered
+prompts are byte-identical.
+
+Nothing is lost. The per-decision specifics are in the audit record's own
+structured fields, and the **template** path — rendered per decision,
+never cached — does name the exact snapped retry time and the governance
+rules that fired. On this project the fallback sentence is the more
+specific of the two, which is an odd but honest outcome worth stating out
+loud rather than hiding.
+
+Alternative considered and rejected: widen the cache key to
+`(reason, bucket, action, policy_verdict, tuple(signals))`. Measured on
+the seed-42 batch this takes 23 distinct keys to 91 — still not 801,
+so it does satisfy "don't make 500 API calls" — and it would let the
+sentence name the reason code. Rejected because the user's spec named the
+three-field key explicitly, and because the marginal value of the model
+restating a reason code that is already displayed verbatim next to it in
+the audit table is close to zero. It is a one-line change to
+`CACHE_KEY_FIELDS` if that judgement changes.
+
+### The async boundary is [DESIGN]; the non-blocking guarantee is [BUILD]
+
+Per the user's instruction, `attach_explanations` runs **synchronously,
+immediately after the decision commit** — no queue, no background worker.
+architecture-and-security.md sec. 4.1 describes a worker filling
+`explanation` in later; that split is the latency optimisation and is
+explicitly not built.
+
+What IS built is the property the worker was supposed to provide, and it
+does not depend on the worker existing:
+
+1. **Dependency direction.** `executor/executor.py`, `policy/policy.py`
+   and `classifier/classify.py` do not import `explain`. Asserted by
+   `test_decision_tier_does_not_import_the_explanation_layer`, which
+   walks the AST of those three files — so it stays true when someone
+   adds a convenient import in six months.
+2. **It only ever sees committed rows.** Every entry point takes an
+   `app.models.Decision` that already has a primary key and is durable.
+3. **It writes two columns.** `explanation` and `explanation_source`.
+   It cannot alter a bucket, verdict, action, schedule or outcome,
+   because it never writes those columns.
+4. **The one call site is guarded.** `app.api._explain_after_commit`
+   catches `Exception` (not `BaseException` — KeyboardInterrupt and
+   SystemExit must still stop the process) and rolls back only the
+   explanation transaction.
+
+`test_a_broken_explanation_layer_cannot_break_a_decision` makes the whole
+layer raise and asserts the decision is committed, correct, scheduled,
+and carries a NULL explanation.
+`test_decision_is_identical_with_and_without_the_explanation_layer` is
+the direct check of the claim in architecture-and-security.md sec. 9.
+
+### FORBIDDEN_IN_PROMPT: the doc's assertion, plus the one that can fire
+
+The architecture doc's sketch is:
+
+```python
+safe = {k: v for k, v in decision.items() if k not in FORBIDDEN_IN_PROMPT}
+assert not (FORBIDDEN_IN_PROMPT & safe.keys())
+```
+
+That assertion is **tautological** — the comprehension on the line above
+guarantees it. It documents intent; it cannot fail. It is kept verbatim
+(good signalling value, and it is what the doc says), and two things were
+added:
+
+- **A value-level scan.** `build_explanation_prompt(context,
+  forbidden_values=...)` searches the *rendered prompt string* for each
+  excluded value and raises `PIILeakError`. This is the layer that
+  catches a `customer_id` that reached the prompt *inside an allowed
+  field* — a signal string, a badly templated bucket label — which the
+  field-name filter structurally cannot see.
+- **An exception, not an `assert`.** `assert` is compiled out under
+  `python -O`. A data-governance control that disappears under an
+  optimisation flag is not a control.
+
+`PIILeakError` is also the **one** exception `Explainer.generate` does not
+swallow into the template fallback: a leak is our bug, not a dependency
+being down, and templating past it would hide exactly what the check
+exists to surface. Tested by
+`test_pii_leak_is_not_swallowed_by_the_fallback`.
+
+Two fields were added to the exclusion set beyond the doc's five
+(`amount_inr`, `mandate_id`, `event_id`, `customer_history`) on the same
+P5 data-minimisation principle: they are what remains that ties a decision
+to one individual's transaction, and the model does not need any of them
+to explain a decision *class*.
+
+### Measured: 801 decisions, 23 API calls
+
+Seed-42, 500 events, the full `/simulate/run`:
+
+| | |
+|---|---|
+| decisions written | 801 |
+| distinct `(bucket, action, policy_verdict)` | 23 |
+| API calls | 23 |
+| calls avoided by the cache | 778 (97%) |
+
+The repo ships no API key, so in the default state all 801 explanations
+come from templates and the API-call count is 0. The 23 above was
+measured with a stub client injected (`explain/demo.py::StubClient`).
+
+### Deviations and known gaps, stated plainly
+
+- **The webhook accepts the PRD sec. 6 flat `FailureEvent`, not
+  Razorpay's `{"event": ..., "payload": {"payment": {"entity": ...}}}`
+  envelope.** The PRD calls it "Razorpay-shaped" but then defines the
+  payload as the flat model, and that flat model is the project's single
+  contract across every module. An envelope adapter is ~20 lines and no
+  insight; every interesting property of the endpoint (constant-time HMAC
+  over raw bytes, dedupe, fail-closed) is identical either way. Gap, not
+  done.
+- **No sample explanation from the real model has been produced.** No
+  `ANTHROPIC_API_KEY` is configured on this machine. `python -m
+  explain.demo` runs the LLM code path against a stub whose sentences are
+  hardcoded in `explain/demo.py`, and prints a four-line capitalised
+  warning saying so. Run `ANTHROPIC_API_KEY=sk-... python -m explain.demo`
+  for a genuine one. Do not screenshot stub output as model output.
+- **Replay protection (timestamp skew > 5 min) is not implemented.** It
+  is [DESIGN] in architecture-and-security.md sec. 3.5 and stays there;
+  the webhook payload carries `failed_at`, not a delivery timestamp, so
+  implementing it properly needs a header Razorpay sends that we do not
+  model.
+- **Rate limiting is not implemented.** Same section, same reason.
+
+### Smaller decisions
+
+- **`Decision.explanation_source`** (`llm` | `template` | NULL) is a new
+  column, not in the PRD's Decision model. "The audit record is the
+  product" (sec. 6) argues an auditor must be able to tell a generated
+  sentence from a fallback one without inferring it from prose style.
+- **`SimulationRun`** is a new table, also not in the PRD's four.
+  `/results/summary` has to answer "what did the last run measure?"
+  across a restart, and the *baseline* arm's per-event records exist
+  nowhere else — baseline writes no decisions because it makes none.
+  Storing the computed metrics rather than 500 baseline rows keeps this
+  to one small row per run.
+- **`simulate_agent_cycle` now returns the decisions it took.** The
+  alternative was for `/simulate/run` to replay classify/policy/execute a
+  second time to produce audit rows. Two independent replays that could
+  silently drift is a worse property than one extra key on a return
+  value; `compute_metrics` ignores the key entirely.
+- **`execute_decision` gained an optional `mandate_state`.** The counters
+  the policy engine's attempt-cap / cooling-off / contact-limit rules read
+  are now advanced inside the *same transaction* as the decision write. A
+  caller committing them separately could crash in between and leave a
+  scheduled attempt the cap doesn't know about — precisely the atomicity
+  sec. 5.2 asks for. Callers that don't track state (the in-memory batch
+  runners, the unit tests) pass nothing and are unaffected.
+- **Column defaults bit us once.** SQLAlchemy's `default=0` applies at
+  INSERT, so a freshly constructed `MandateState` still has `None` in its
+  counters — and the policy engine reads the object before it is flushed
+  (`None >= 3` is a TypeError). Found on the first end-to-end webhook run.
+  `load_or_open_mandate_state` now sets every counter explicitly.
+- **`/reset` and `/simulate/run` are deliberately distinct.** `/reset`
+  clears the DB and regenerates the batch as *raw events only*;
+  `/simulate/run` clears, decides, and measures. Blending two batches'
+  numbers in `/results/summary` would be a worse property than a
+  resettable demo DB.
+- **`claude-opus-5`, `max_tokens=1000`.** Generous for two sentences on
+  purpose: thinking is on by default on Opus 5 and counts against
+  `max_tokens`, so a tight cap risks the budget being spent before any
+  visible text is emitted — which surfaces as an empty explanation, not
+  an error. An empty response is treated as a failure and falls back
+  (`test_every_failure_mode_falls_back_to_a_non_empty_template`,
+  `empty_response` case). The cache means this ceiling is paid ~23 times
+  per batch.

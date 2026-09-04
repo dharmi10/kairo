@@ -89,6 +89,26 @@ def simulate_agent_cycle(event: dict, matrix: DecisionMatrix, context_outcomes: 
     recovered_at = None
     human_approved = False
     human_review = None  # None | "approved" | "rejected" -- for diagnostics only, not used by compute_metrics
+    # Phase 7: every decision this cycle takes, in order, so the API layer
+    # can persist the FULL audit trail rather than only the first decision
+    # per event. compute_metrics ignores this key; it exists purely so the
+    # decision records and the metrics come from ONE execution of the
+    # cycle instead of two independent replays that could silently drift.
+    decisions: list[dict] = []
+
+    def record(classification, verdict, reasons, plan, decision_outcome, amount_recovered=0):
+        decisions.append(
+            {
+                "classification": classification,
+                "policy_verdict": verdict,
+                "policy_reasons": reasons,
+                "plan": plan,
+                "outcome": decision_outcome,
+                "amount_recovered_inr": amount_recovered,
+                "decided_at": current["failed_at"],
+                "retry_attempt_number": mandate_history["total_retry_attempts"] + 1,
+            }
+        )
 
     for _ in range(MAX_LOOP_ITERATIONS):
         classification = classify(current, matrix)
@@ -113,6 +133,7 @@ def simulate_agent_cycle(event: dict, matrix: DecisionMatrix, context_outcomes: 
             # the whole cycle, not per-attempt.
             review_time = current["failed_at"] + timedelta(hours=HUMAN_REVIEW_DELAY_HOURS)
             review_rng = deterministic_random(seed, event["event_id"], "human_review")
+            record(classification, verdict, reasons, plan, "NOT_ATTEMPTED")
             if review_rng.random() < HUMAN_REVIEW_APPROVAL_RATE:
                 human_approved = True
                 human_review = "approved"
@@ -126,8 +147,10 @@ def simulate_agent_cycle(event: dict, matrix: DecisionMatrix, context_outcomes: 
             if draw_retry_outcome(event, plan["scheduled_for"], context_outcomes, seed):
                 outcome = "RECOVERED"
                 recovered_at = plan["scheduled_for"]
+                record(classification, verdict, reasons, plan, "RECOVERED", event["amount_inr"])
                 break
 
+            record(classification, verdict, reasons, plan, "FAILED")
             mandate_history["total_retry_attempts"] += 1
             mandate_history["last_attempt_at"] = plan["scheduled_for"]
             if plan["effective_bucket"] == "B1_CONGESTION":
@@ -166,9 +189,14 @@ def simulate_agent_cycle(event: dict, matrix: DecisionMatrix, context_outcomes: 
             if draw_nudge_acceptance(event, plan["effective_bucket"], context_outcomes, seed):
                 outcome = "RECOVERED"
                 recovered_at = current["failed_at"] + timedelta(hours=NUDGE_ACCEPTANCE_DELAY_HOURS)
+                record(classification, verdict, reasons, plan, "RECOVERED", event["amount_inr"])
+            else:
+                record(classification, verdict, reasons, plan, "FAILED")
             break
 
-        break  # STOPPED -- terminal, no more autonomous action (HUMAN_QUEUE is handled above)
+        # STOPPED -- terminal, no more autonomous action (HUMAN_QUEUE is handled above)
+        record(classification, verdict, reasons, plan, "NOT_ATTEMPTED")
+        break
 
     hours_to_recovery = (recovered_at - event["failed_at"]).total_seconds() / 3600 if recovered_at else None
 
@@ -181,4 +209,5 @@ def simulate_agent_cycle(event: dict, matrix: DecisionMatrix, context_outcomes: 
         "contacts_sent": contacts_sent,
         "hours_to_recovery": hours_to_recovery,
         "human_review": human_review,  # None | "approved" | "rejected" -- diagnostic only
+        "decisions": decisions,  # Phase 7: the audit trail this cycle produced, in order
     }
