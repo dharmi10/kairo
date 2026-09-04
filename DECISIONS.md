@@ -476,6 +476,668 @@ context for why the amount assumptions are realistic, with the caveat
 that this is secondary-source reporting on the regulation, not a citation
 of RBI's own circular text.
 
+## 2026-09-03 — Phase 5: executor built
+
+`backend/executor/executor.py` -- two layers, deliberately separated:
+`resolve_action()` is pure (event, classification, policy_verdict,
+policy_reasons, mandate_history, matrix) -> a plan; `execute_decision()`
+is the only impure function, writing Decision + Attempt to the same
+SQLAlchemy Session and committing once (both persist or neither does --
+architecture-and-security.md sec. 5.2's atomicity requirement).
+
+**Real bug caught by the whole-batch test, not by review:**
+`test_zero_scheduled_retries_fall_in_restricted_window_across_full_batch`
+crashed with `KeyError: 'delay_hours'` on its first run. Cause: the four
+ambiguous B3 codes (`payment_failed`, `card_declined`, `debit_declined`,
+`payment_declined`) never got a `delay_hours` field in
+`decision_matrix.yaml` -- Phases 2-3 only ever needed their
+bucket/action/confidence, so the gap was invisible until the executor
+actually tried to schedule a retry for one. Fixed both ends: added
+`delay_hours: 3` to all four (matching `gateway_technical_error`'s delay,
+the closest sibling), and made the executor's delay lookup defensive
+(`.get("delay_hours", ...)` instead of `[...]`) so a future missing field
+degrades to the documented fallback instead of crashing the batch.
+
+**Shared `app/dates.py`:** extracted `next_payday_on_or_after` out of
+`generator/oracle.py` (private there since Phase 2) into a shared module,
+since the executor's B2 income-window scheduling needs the exact same
+date-rollover logic (payday nearest-or-after a date, clamped to month
+length, rolling to next month). `oracle.py` updated to import it instead
+of keeping its own copy.
+
+**Design choices worth remembering:**
+- B1_CONGESTION reached via the timing+history override (signalled by
+  `"fired_in_restricted_window"` in classify()'s signals) uses
+  `congestion_override["play"]`'s delay; reached via the direct code
+  (`payment_declined_due_to_high_traffic`) uses that code's own play.
+  Disambiguated via the signal, not by inspecting the reason string, so
+  it stays correct if more direct-mapped congestion codes are ever added.
+- `reclassify_after_max_attempts` detection (`_effective_classification`)
+  is explicit, via a dedicated marker signal
+  (`reclassified_after_2_failed_congestion_retries`), NOT inferred from
+  bucket-equality comparisons. An earlier draft compared
+  `play["bucket"] == classification["bucket"]` to detect "was this
+  reclassified away from its own code's bucket" -- that coincidentally
+  "worked" for `gateway_technical_error`/`payment_failed` only because
+  their own declared bucket already IS `B3_TRANSIENT`, which would have
+  silently broken (or silently "worked for the wrong reason") the moment
+  the matrix changed. Caught in review before it shipped, not by a test.
+- **One deliberate, narrow exception to Phase 4's policy verdict, not a
+  general override of it:** `BLOCK` due specifically to
+  `hard_decline_never_retried` still allows the matrix's prescribed
+  NUDGE action to fire (`NUDGE_SENT`) -- PRD/decision-matrix.md are
+  explicit that every B5_DEAD code gets "no retry, immediate
+  re-authorisation nudge", and `hard_decline_never_retried` is
+  specifically about blocking the *retry*, not blanket silence. Every
+  OTHER `BLOCK` reason (cycle expired, attempt cap, cooling-off, max
+  contacts) still means "no autonomous action of any kind" -- that
+  blanket reading is left exactly as Phase 4 built and tested it, not
+  relitigated here.
+- The matrix's own per-code `ESCALATE_HUMAN` action wins even under an
+  `ALLOW` policy verdict (e.g. `mandate_amount_exceeded` at a low amount,
+  which no M4 rule independently catches) -- same "more conservative
+  wins" principle as M4's worst-wins, applied one layer up.
+- `NEW_MANDATE_FLOW` (the `mandate_expired` placeholder's action) maps to
+  `STOPPED` -- genuinely out of this system's scope (PRD sec. 3 excludes
+  mandate creation), so there's no better fit in the action vocabulary.
+
+**Tests:** `tests/test_executor.py`, 22 tests, all passing (68 total
+across the project). Includes the two explicitly-requested checks: the
+whole-batch zero-restricted-window assertion, and dedicated
+reclassify_after_max_attempts tests for both branches (no balance
+history -> B3, balance history -> B2) plus a negative case (1 failed
+attempt, not yet 2 -> no reclassification).
+
+**Outcome counts, seed=42, n=500 (fresh mandate_history per event, same
+convention as `policy/report.py`):** RETRY_SCHEDULED 372 (74.4%),
+NUDGE_SENT 61 (12.2%), HUMAN_QUEUE 50 (10.0%), STOPPED 17 (3.4%). 111 of
+372 scheduled retries needed window-snapping; zero landed in the
+restricted window after snapping. `reclassify_after_max_attempts` cannot
+fire on this fresh-history batch (needs 2 prior failed B1 retries, which
+no event in a first-failure-only batch has) -- demonstrated separately
+via a hand-built scenario in `executor/pipeline.py`, same pattern used for
+Phase 3's ambiguity-reclassification path and Phase 4's attempt-cap rule.
+
+## 2026-09-03 — Phase 6: baseline simulator + metrics — two real bugs found and fixed
+
+`backend/baseline/baseline.py` (M6), `backend/executor/simulate.py` (the
+agent's full-cycle "outcome resolver" -- new orchestration; Phases 3-5
+each deliberately computed ONE decision against fresh state, but the five
+metrics need to know whether a mandate's cycle actually RESOLVES),
+`backend/metrics/metrics.py` + `metrics/report.py`. `python -m
+metrics.report` runs both arms against the identical batch and prints the
+aggregate + by-bucket comparison. 11 new tests
+(`tests/test_simulation.py`, 79 total project-wide), two of which are
+regression tests for the bugs below.
+
+**Bug 1 — independent draws under identical context still compound, even
+with a "conditional" oracle.** First run of the comparison: agent LOST to
+baseline by -49.4% on Rs recovered. Root cause: baseline retries at the
+SAME hour, 3 days running -- for B1_CONGESTION that's the same
+restricted-window context (p=0.35) three times. Being "conditional on
+context, not attempt number" (the whole point of the September oracle
+redesign) stops probability from artificially escalating with attempt
+count, but says nothing about whether REPEATED attempts under UNCHANGED
+context should be independent drawer -- and my simulation was drawing
+independently at every attempt regardless. Three independent draws at
+p=0.35 still compound to 1-(1-0.35)^3 = 72.5%, which is exactly the same
+class of artifact the conditional redesign was built to prevent, just
+reintroduced one layer up (in how the simulation consumes the oracle,
+not in the oracle's probabilities). **Fix:** `generator/oracle.py` gained
+`oracle_context_key()` (bucket + context-state, e.g. `("B1_CONGESTION",
+"restricted_window")`) and `draw_retry_outcome()`, which caches ONE drawn
+outcome per (event, context-key) and reuses it for every subsequent
+attempt sharing that key -- "we already tried under these exact
+conditions and it didn't work" is what "the underlying cause persists"
+(the original oracle-design reasoning) actually implies. The cache is
+created FRESH per event and shared between that event's agent AND
+baseline simulation, so if both arms happen to retry under the identical
+context, they see the identical simulated reality rather than a separate
+coin flip per arm.
+
+**Bug 2 — cooling-off self-collision silently capped every mandate at
+exactly 1 retry.** After fixing Bug 1, agent still lost (-21.5%). Traced
+via a direct comparison of mismatched B3 outcomes: several showed the
+agent making 0 or 1 attempts where baseline (correctly, per Bug 1's fix,
+using the SAME cached draw) recovered on attempt 1 -- meaning the agent
+was failing to retry at all in cases it should have. Root cause: after a
+failed retry, `simulate_agent_cycle` advanced `current["failed_at"]` to
+exactly `plan["scheduled_for"]` (the retry's own firing time) AND set
+`mandate_history["last_attempt_at"]` to that identical value. The next
+loop iteration's cooling-off check (`current["failed_at"] -
+last_attempt_at`) then compared that attempt against itself -- always a
+0h gap, always < the 2h floor, regardless of the bucket's actual
+`delay_hours` (3h for most of B3, well clear of cooling-off). This
+silently capped every mandate at exactly 1 real retry attempt no matter
+what the matrix said, for the entire batch, invisibly (no error, no test
+failure -- just a systematically wrong number). **Fix:** advance
+`current["failed_at"]` to `plan["scheduled_for"] + cooling_off_hours`,
+not `plan["scheduled_for"]` itself -- the next decision point is modelled
+as occurring no sooner than the cooling-off floor after the last attempt,
+so resolve_action's own bucket-specific delay is computed from a point
+that can't collide with itself. Slow buckets (delay > cooling-off)
+barely notice; the handful of fast ones (B1's 0-1h delay,
+`payment_timed_out`'s 0h) get floored up to 2h, which is arguably more
+correct anyway. Regression test:
+`test_agent_can_make_more_than_one_retry_attempt_when_delay_exceeds_cooling_off`
+forces every draw to fail and asserts the loop doesn't get stuck at
+exactly 1 attempt.
+
+**After both fixes: aggregate uplift is still -17.4% Rs recovered
+(though recovery RATE now favours the agent, +8.8 points, 46.8% vs
+38.0%) -- investigated further per the user's explicit instruction to
+check anomalous uplift, not just fix bugs and stop.** Root cause of the
+REMAINING gap is not a bug: 67 events (Rs.865,773 of volume) get ZERO
+autonomous action from the agent -- correctly escalated to a human
+(high-value, risk-flagged, repeat-offender) or hard-stopped (cycle
+expired, attempt cap, cooling-off) per M4's governance rules. Baseline
+has no governance concept at all and blindly attempts every one of those
+same events, sometimes recovering money the agent's policy deliberately
+routed elsewhere. Counting those as "Rs.0 recovered by the agent" in a
+2-arm $ comparison penalizes the agent for a genuine safety property
+baseline doesn't have -- it does not model what a human reviewer would
+recover after escalation (not zero, in reality). **Excluding those 67
+zero-action events from both arms: uplift is +30.5%, recovery rate 54.0%
+vs 40.2%** -- squarely inside the 10-50% defensible band, and this
+isolates the actual retry-timing/classification intelligence from the
+governance-routing decision. `metrics/report.py` prints BOTH numbers: the
+literal full-population metric (matching the PRD's metric definition
+exactly, for the headline) and this diagnostic breakdown (for
+understanding what's driving it) -- not silently substituting one for
+the other. The headline "Rs recovered" metric was NOT redefined to
+exclude escalations; that's a framing decision for the pitch, left to the
+user rather than decided unilaterally here.
+
+**By-bucket note:** B4_STRUCTURAL (n=23, the smallest bucket) shows
+baseline recovering 43.5% against an oracle probability of 20% per
+context -- a ~2.8-sigma outcome for this specific seed on a small sample,
+not a bug (verified: B4's context state is always `"always"`, i.e. one
+shared draw per event since context never varies with retry timing;
+23 independent per-event draws at p=0.20 have real sampling variance).
+Worth knowing before citing per-bucket numbers from small buckets as if
+they were precise.
+
+**Kept out of scope, flagged for the record:** nudge-driven recovery
+(`NUDGE_ACCEPTANCE_PROBABILITIES` in oracle.py, e.g. p=0.30 for a B5
+reauth nudge being accepted) is still not wired into either simulation --
+a `NUDGE_SENT` action is terminal for $-recovery purposes in both this
+phase's agent simulator. This is a deliberate scoping choice, not an
+oversight: modelling nudge acceptance would inject a second, different
+recovery mechanism (customer behaviour, not retry timing) into a
+comparison meant to isolate the timing/classification thesis specifically.
+Available as a documented, ready-to-wire extension if the pitch wants to
+show it separately.
+
+## 2026-09-03 — Escalation modelled as human review, not permanent loss; full-population uplift re-run
+
+**The problem with the -17.4% headline, per the user:** the prior phase's
+$-recovered comparison modelled every `ESCALATE`d event as Rs.0 recovered
+forever. That's not what escalation means — a human reviews the case and
+approves or rejects it, usually within a business day. Modelling it as a
+black hole made governance look like pure cost, which is neither
+realistic nor the point of building governance in the first place.
+Excluding escalated events from the comparison (the prior phase's
+diagnostic +30.5%) wasn't accepted as the fix either — that's a different
+kind of dodge, just hiding the population instead of mis-modelling it.
+
+**Fix: human review as delay-and-filter** (`executor/simulate.py`,
+`executor/executor.py`). When `resolve_action` returns `HUMAN_QUEUE`, the
+simulation now waits 12h (ASSUMPTION) then draws approval at 70%
+(ASSUMPTION) — both cited in the README ("Human review of escalated
+events") next to the oracle's own assumption block, not asserted as
+measured. Approved cases advance the clock past the review delay and
+re-enter the SAME classify → policy → resolve_action → oracle path as
+every other event, with no special-cased recovery logic — the oracle call
+(`draw_retry_outcome`) and its `context_outcomes` cache are unchanged.
+Rejected cases (30%) end the cycle not-recovered.
+
+`resolve_action` gained a `human_approved: bool = False` parameter
+(default preserves all existing test behaviour — 79/79 tests still pass
+unmodified) rather than duplicating its matrix-lookup logic in
+`simulate.py`, per M1's "no decision logic hardcoded elsewhere"
+principle. Approval doesn't blanket-override the policy verdict: if the
+same decision also carries one of rule 5-9's independent BLOCK reasons
+(hard decline, cycle expired, attempt cap, cooling-off, max contacts —
+`_BLOCK_ONLY_REASONS` in `executor.py`), it still resolves to BLOCK after
+approval, same worst-wins principle used throughout M4/M5. A pure
+ESCALATE (no BLOCK reason riding along) resolves to ALLOW, and the
+matrix's own per-code `ESCALATE_HUMAN` preference is skipped once
+approved (the human already reviewed this case; it doesn't route back to
+the queue a second time — verified no infinite loop for
+`mandate_amount_exceeded`, whose matrix action is `ESCALATE_HUMAN` with
+no underlying retry/nudge play, so an approved instance now resolves to
+`STOPPED`, i.e. "human handled it outside the automated system").
+
+**Result, seed=42/20260903, full population, no exclusions:**
+
+- Rs recovered uplift: **-17.4% → +50.1%** (agent Rs.892,622 vs baseline
+  Rs.594,520). Recovery rate: 51.0% vs 37.2% (+13.8 points — a smaller,
+  more plausible move than the $ swing, see below).
+- 50 events escalated, 35 approved (70.0%, matches the target rate — not
+  tuned, just what a 500-event batch produces), 15 rejected.
+- The $ swing is much larger than the recovery-rate swing because
+  escalation correlates heavily with `high_value_amount`
+  (`policy.py` rule 4) — the events previously locked out of the agent's
+  $-recovered total at Rs.0 were disproportionately the *largest*
+  payments in the batch. Once ~70% of them proceed through the normal
+  recovery play (at ordinary per-bucket recovery odds), they add a
+  disproportionate share of rupees relative to their share of event
+  count. This is not a bug — it is exactly the dollar-weighted effect
+  you'd expect once big-ticket escalations stop being modelled as
+  automatic write-offs.
+- **Honest caveat, not smoothed over:** `metrics/report.py`'s own sanity
+  check flags anything above ~50% as "may be too generous, consider
+  tuning" — +50.1% sits right on that line, not comfortably inside the
+  10-50% band the prior phase called defensible. Not retuned to force it
+  under the flag; that would be gaming the number the same way excluding
+  escalated events would have been. Worth re-checking after any future
+  change to the amount distribution, escalation threshold, or oracle
+  probabilities, per the existing "re-run `python -m metrics.report`
+  before calling it done" discipline.
+
+## 2026-09-03 — B4_STRUCTURAL 0% recovery: confirmed genuine decision-matrix gap, not sampling noise
+
+The user asked for this to be checked specifically, since the prior
+phase's 0% agent / 43.5% baseline B4 comparison had been attributed to
+small-n sampling variance (n=23). Re-investigated by instrumenting the
+seed=42 batch's 23 `B4_STRUCTURAL` events directly
+(`resolve_action`'s first decision per event, before any retry loop):
+
+**1 of 23 events gets a scheduled retry. 20 of 23 get `NUDGE_SENT` as
+their first and only action. The remaining 2 escalate.** This is not a
+scheduling bug — it's `decision_matrix.yaml` working exactly as
+specified: 8 of B4's 11 reason codes (`incorrect_otp`,
+`otp_attempts_exceeded`, `otp_expired`, `pin_attempts_exceeded`,
+`transaction_on_vpa_restricted`, `authentication_failed`,
+`incorrect_cvv`, `credit_limit_exceeded`, `transaction_limit_exceeded`,
+`transaction_frequency_limit_exceeded`) carry `action:
+NUDGE_CUSTOMER_LINK` / `NUDGE_REENGAGE` with `max_attempts: 0` — the
+matrix's own design, matching `recovery-decision-matrix.md`'s original
+table verbatim ("Customer-initiated retry link (agent cannot fix OTP
+autonomously)"). Only `transaction_daily_count_exceeded` has an
+autonomous `RETRY` play.
+
+**Why that reads as 0% $-recovered:** per the existing, previously-flagged
+scoping decision (see the Phase 6 entry above, "nudge-driven recovery...
+kept out of scope"), `NUDGE_SENT` is terminal for $-recovery purposes in
+this simulation — `NUDGE_ACCEPTANCE_PROBABILITIES["B4_STRUCTURAL_channel_switch"]
+= 0.45` exists in `generator/oracle.py` but is not wired into
+`executor/simulate.py`. So B4's simulated $-recovery is effectively
+gated entirely on that single retryable code (which, on this seed, didn't
+recover — one Bernoulli(0.20) draw, 80% chance of exactly this outcome,
+so *that* part genuinely is small-sample noise) while every nudge-routed
+event contributes Rs.0 by construction, not by chance.
+
+**This compounds with the baseline's blindness in the wrong direction for
+a bucket comparison:** baseline has no concept of "this needs a customer
+action, not a blind retry" — it retries all 23 B4 events regardless of
+code, including the ones the matrix deliberately routes to a
+customer-facing nudge because the agent structurally cannot fix them
+(wrong OTP, expired OTP, limit exceeded) by retrying the SAME failed
+attempt. So baseline's ~20-22% recovery on B4 isn't "baseline handling
+structural failures better" — it's the oracle's flat B4_STRUCTURAL
+p=0.20 applying to blind retries Razorpay's real system also would not
+expect to work for an OTP/limit failure (retrying an expired OTP without
+a fresh customer action doesn't make sense against a real bank/PSP
+either — the oracle's flat 0.20 for B4 is itself the least-scrutinized
+number in `ORACLE_PROBABILITIES`, carried over unchanged from the PRD's
+original spec with no bucket-specific reasoning recorded anywhere).
+
+**Verdict: genuine gap, not noise — flagged, not fixed, per the user's
+question (investigate, don't just patch).** Two independent things drive
+B4's number, and both are real, not artifacts of this seed:
+1. The decision matrix correctly withholds autonomous retry for
+   8 of 11 B4 codes (matches source doc; not a bug to fix).
+2. The simulation doesn't model nudge acceptance as recovered revenue
+   for ANY bucket (B4 or B5), which was an explicit, previously-recorded
+   scope decision, not an oversight — but it lands hardest on B4
+   specifically because B4 is overwhelmingly nudge-routed, unlike B5
+   where nudge-only was always going to mean "recovers via a different,
+   unmodelled mechanism" that nobody claimed was in scope.
+
+**Left as a decision for the user, not resolved unilaterally:** wiring
+`NUDGE_ACCEPTANCE_PROBABILITIES` into the $-recovery simulation (for both
+B4 and B5) would make the by-bucket comparison for those two buckets
+meaningful again — right now B4's row in `metrics/report.py`'s by-bucket
+table should be read as "agent routes to nudge, doesn't blindly retry",
+not "agent recovers less money than baseline on structural failures". If
+B4's by-bucket row is going in front of a judge, caveat it explicitly
+rather than presenting it next to B1/B2/B3's rows as if they measure the
+same thing.
+
+## 2026-09-03 — Nudge acceptance wired into $-recovery; honest uplift is +29.3%
+
+**The problem, per the user:** `NUDGE_ACCEPTANCE_PROBABILITIES` (0.30 B5
+reauth, 0.45 B4 channel-switch) had sat in `generator/oracle.py`, unused,
+since Phase 2 — every `NUDGE_SENT` action scored Rs.0 in the $-recovered
+comparison, while every baseline blind retry could still win. That's not
+conservatism, it's a hole in the metric: the agent got zero credit for
+correctly choosing "this needs a customer action, not a blind retry"
+instead of just not modelling that choice's payoff. Landed hardest on
+B5_DEAD, which sends nothing but reauth nudges by construction (retrying
+a dead instrument is never attempted) and was scoring a flat, structural
+0% recovery regardless of how many customers would realistically reauth
+in reality.
+
+**Fix** (`generator/oracle.py::draw_nudge_acceptance`,
+`executor/simulate.py`'s `NUDGE_SENT` branch): a nudge now draws
+acceptance from `NUDGE_ACCEPTANCE_PROBABILITIES`, keyed off the
+decision's `effective_bucket` via the new `NUDGE_ACCEPTANCE_KEY_BY_BUCKET`
+map (B5_DEAD → 0.30, B4_STRUCTURAL → 0.45 — the only two buckets the
+matrix ever routes to `NUDGE_SENT`, so this covers every real case, with
+a fail-closed p=0.0 default for anything else). Uses the SAME
+`context_outcomes` correlated-draw cache pattern as `draw_retry_outcome`
+— per the user's explicit instruction, no special treatment — keyed as
+`(bucket, "nudge_acceptance")`, a marker string that cannot collide with
+a real `(bucket, context-state)` retry key (verified with a dedicated
+test: `test_draw_nudge_acceptance_does_not_collide_with_a_retry_outcome_key`).
+An accepted nudge recovers the full amount **24h** after being sent
+(ASSUMPTION, `NUDGE_ACCEPTANCE_DELAY_HOURS` — "customers don't act
+instantly," no data to calibrate against, documented in the README next
+to the human-review delay it parallels). A rejected nudge ends the cycle
+not-recovered, same shape as a rejected human review. 8 new tests
+(`tests/test_simulation.py`), 91 total project-wide.
+
+**Baseline: explicitly NOT given an equivalent, and said so out loud, per
+the user's instruction.** `baseline/baseline.py` is retry-only — it has
+no customer-facing action at all, so there's nothing to wire in. Rather
+than let that asymmetry sit silently in the code,
+`metrics/report.py` now prints it directly: "Baseline sends 0 nudges...
+this is a real, structural asymmetry between the two arms, not a metrics
+gap." The agent's B4/B5 advantage is now visibly coming partly from
+taking an action baseline structurally cannot take, not only from better
+retry timing — worth saying explicitly if asked in Q&A, not something to
+let a judge assume without the caveat.
+
+**Result, seed=42/20260903, full population, no exclusions: uplift
++50.1% → +29.3%** (agent Rs.914,099 vs baseline Rs.706,980; recovery rate
+51.8% vs 40.6%). This is now **inside** `metrics/report.py`'s own 10-50%
+"defensible band" check, not sitting at its edge — the user's stated
+preference ("a defensible metric over a comfortable one") was satisfied
+by wiring the fix honestly, not by retuning anything; the number moved
+because a real gap in the model closed, and it happened to land inside
+the band rather than needing to be pulled there.
+
+- 65 nudges sent (43 B5 reauth, 22 B4 channel-switch), 19 accepted
+  (29.2% — close to the blended expectation given the B5/B4 mix at their
+  respective 30%/45% probabilities), Rs.83,446 recovered via nudge
+  acceptance alone.
+- B5_DEAD by-bucket: agent recovery **0% → 12.7%** (Rs.53,609) — no
+  longer a flat zero; still well below B4/baseline-attempt-based buckets,
+  which is expected (0.30 is the lowest acceptance rate in the table and
+  most B5 codes are genuinely dead instruments).
+- B4_STRUCTURAL by-bucket: agent recovery **0% → 43.5%** (Rs.29,837),
+  now clearly ahead of baseline's 26.1% (Rs.25,789) on this bucket
+  instead of reading as a loss — directly answers the prior session's B4
+  investigation (see the entry above): the agent wasn't failing on B4, it
+  was correctly routing to nudges the simulation didn't yet credit.
+- Human review counts shifted slightly from the prior run (50 escalated,
+  36 approved this time vs 35 before) purely because nudge-acceptance
+  draws are new calls against the same shared, sequentially-consumed
+  seeded RNG (`metrics/report.py`'s `SIMULATION_SEED`) — inserting new
+  draws upstream shifts what every later draw in the sequence produces,
+  for both arms (baseline's own Rs recovered moved too, 594,520 → 706,980,
+  for the identical reason, not because baseline changed at all).
+  Expected and still fully reproducible given the code as it now stands,
+  not nondeterminism.
+
+## 2026-09-03 — Independent deterministic RNG streams; multi-seed robustness check
+
+**Problem 1, per the user:** the whole comparison shared ONE seeded
+`random.Random`, consumed sequentially across the batch (agent's draws
+for event 1, baseline's draws for event 1, event 2's, ...). That's a
+defensibility problem, not just a code-cleanliness one: inserting a NEW
+draw anywhere upstream shifts the RNG state for every draw after it, for
+BOTH arms, even when nothing about the thing being drawn changed. Already
+observed in practice at the end of the last session: wiring nudge
+acceptance shifted baseline's own Rs-recovered figure (594,520 →
+706,980) even though baseline's code hadn't changed at all. That means
+"the baseline recovers Rs.X" was never a stable, citable fact — it moved
+whenever unrelated agent-side code changed.
+
+**Fix** (`app/rng.py`, new module): `deterministic_random(seed, *parts)`
+derives a fresh `random.Random` from a SHA-256 hash of `(seed, *parts)`
+(SHA-256, not Python's builtin `hash()` — `hash()` on a `str` is
+randomized per-process via `PYTHONHASHSEED` and is NOT reproducible
+across runs). Every draw site now derives its own independent stream:
+
+- `generator/oracle.py::draw_retry_outcome` — keyed
+  `(seed, event_id, "retry", bucket, context_state)`.
+- `generator/oracle.py::draw_nudge_acceptance` — keyed
+  `(seed, event_id, "nudge", bucket)`; gained an `event` parameter (was
+  bucket-only) since the event id is now part of the key.
+- `executor/simulate.py`'s human-review approval draw — keyed
+  `(seed, event_id, "human_review")`.
+
+All three functions that used to take a shared `rng: random.Random`
+(`draw_retry_outcome`, `draw_nudge_acceptance`, `simulate_agent_cycle`,
+`simulate_baseline_cycle`) now take `seed`, normally an int. The
+`context_outcomes` correlation cache (same event + same context ⇒ same
+outcome, shared between arms) is UNCHANGED — this only changes where the
+entropy for a brand-new key comes from, not the correlation mechanism
+itself. `deterministic_random` also accepts an existing `random.Random`
+directly (used as-is, ignoring `parts`) — a documented test-only escape
+hatch so existing tests that force a specific outcome (`AlwaysSucceedRng`
+etc.) keep working unchanged rather than needing to reverse-engineer an
+integer seed that happens to produce the desired float; production code
+always passes a plain int.
+
+**Verified, not just asserted:** 6 new tests in `tests/test_rng.py`
+(reproducibility, independence across parts/event-id/seed, the
+test-escape-hatch pass-through) plus
+`tests/test_simulation.py::test_agent_cycle_outcome_is_order_independent_across_events_with_same_int_seed`,
+which simulates one event before and after an unrelated event with the
+same seed and asserts identical outcome/attempts/recovery-time either
+way — the exact property a shared sequential stream could not guarantee.
+99 tests total, all passing.
+
+**Consequence, stated plainly rather than smoothed over: the headline
+number moved again on the same nominal seed, because the actual draws
+are now genuinely different, not because anything is broken.**
+seed=42/20260903 (batch_seed/sim_seed) now reads **+60.1%** (agent
+Rs.1,020,617 vs baseline Rs.637,405), vs the prior session's +29.3%. This
+is not a bug and not a "which one is correct" question — the old number
+was produced by a sequential-consumption architecture that is no longer
+in the code; the new number is a different, independently-drawn sample
+under the fixed architecture. Neither number, on its own, was ever a
+sound thing to present as *the* uplift — which is exactly what problem 2
+was about.
+
+**Problem 2, per the user: report the uplift across several seeds, not
+one.** `metrics/report.py` was refactored to expose
+`run_comparison(batch_seed, sim_seed, matrix) -> dict` (pure, returns
+every number instead of printing) with `main()` now a thin wrapper that
+calls it once (seed 42/20260903) and prints the full detailed report
+(`print_full_report`). New `metrics/multi_seed.py`
+(`python -m metrics.multi_seed`) runs `run_comparison` across 5 fixed
+seeds — `SEEDS = [42, 7, 123, 2024, 55555]`, chosen once before first
+run and not adjusted afterward — pairing each seed as BOTH `batch_seed`
+and `sim_seed`, so each run generates a genuinely different 500-event
+population AND a genuinely different set of draws, not just different
+dice on the same fixed batch.
+
+**Result:**
+
+| seed | agent Rs | baseline Rs | uplift | rate delta |
+|---|---|---|---|---|
+| 42 | 828,296 | 640,159 | +29.4% | +14.6pt |
+| 7 | 845,095 | 602,314 | +40.3% | +17.0pt |
+| 123 | 996,061 | 781,612 | +27.4% | +14.0pt |
+| 2024 | 780,333 | 762,468 | **+2.3%** | +14.6pt |
+| 55555 | 988,532 | 745,698 | +32.6% | +17.2pt |
+
+Uplift: min +2.3%, mean +26.4%, max +40.3%, stdev 14.3 points (n=5).
+Recovery-rate delta: min +14.0, mean +15.5, max +17.2 points.
+
+**Honest read, per the user's explicit preference for defensible over
+comfortable:**
+- **Recovery rate is the stable, presentable number** — a tight
+  14.0-17.2 point band across 5 independently-generated populations. The
+  agent reliably recovers more OF THE FAILURES, seed after seed.
+- **Rs-recovered uplift is NOT stable** — it ranges from +2.3% to
+  +40.3%, a 38-point spread on n=5, and one seed (2024) falls below
+  `metrics/report.py`'s own 10% "may not be materialising" flag. A
+  single-seed Rs-uplift number (whichever seed) should never be
+  presented alone; it should be given as the range with the mean, and
+  ideally alongside the recovery-rate delta, which doesn't have this
+  problem.
+- **Root cause of the spread, checked, not just observed:** seed 2024's
+  detailed report (`run_comparison(2024, 2024, matrix)`) shows
+  B3_TRANSIENT's recovery RATE is close between arms (70.8% agent vs
+  72.3% baseline) but its Rs-recovered is not (Rs.293k vs Rs.417k) — a
+  small number of high-value events (log-normal amount distribution,
+  real tail — see the amount-distribution entry above) landing on
+  different sides of an otherwise-close race is enough to swing a
+  dollar-weighted metric substantially without the underlying
+  recovery-rate advantage moving much at all. This is a genuine property
+  of measuring a skewed-amount population with n≈500, not a modelling
+  bug, and not something to fix by tuning — it's the reason a range
+  matters more than any single point estimate here.
+- **Not tuned to narrow the spread.** The spread is the finding, per the
+  user's stated preference: "if the spread is wide that's something I
+  need to know now." It is wide. Recorded here rather than smoothed into
+  a single reassuring number.
+
+## 2026-09-03 — 20-seed robustness check; M8 dashboard spec updated (not yet built)
+
+**Extended the multi-seed check from n=5 to n=20** per the user
+("n=5 gives a very noisy estimate of the mean, and 20 runs cheaply").
+`metrics/multi_seed.py`'s `SEEDS` grew from `[42, 7, 123, 2024, 55555]`
+to those 5 plus 15 more small ascending integers
+(`1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 13, 15, 17, 19, 21`) — kept the
+original 5 for continuity with the prior report, chosen once and not
+adjusted after seeing results, same discipline as before. Also added an
+explicit "how many seeds fall below the +10% floor" count, since the
+user specifically wanted to be able to say with a number whether seed
+2024's original +2.3% was a tail case or a common outcome.
+
+**Result, n=20:** uplift min +2.3%, mean +24.3%, max +68.5%, stdev 15.2
+points. Recovery-rate delta: min +12.0, mean +15.1, max +18.6 points.
+**5 of 20 seeds (25%) fall below the +10% floor** (2024, 4, 10, 19, 21 —
++2.3% to +8.6%), 1 of 20 (5%) falls above the +50% ceiling (seed 3,
++68.5%).
+
+**Answer to the user's actual question: seed 2024 was NOT a tail case.**
+At 25%, a sub-10% Rs-uplift outcome happens roughly 1 run in 4 — common,
+not rare. The n=5 sample last session (1 of 5 below +10%, 20%) had
+already pointed the same direction; n=20 confirms it with a number
+instead of a vibe. Recovery-rate delta stayed tight (12.0–18.6 points)
+across all 20 seeds, same conclusion as before, now on 4x the sample:
+**recovery rate is stable, Rs-recovered uplift is not, and roughly a
+quarter of the time the Rs-uplift figure alone would read as "the agent's
+advantage isn't materialising" even though the recovery-rate advantage is
+holding steady underneath it.** Not tuned to narrow this — per the user,
+the variance is a real property of a skewed-amount population (log-normal
+`AMOUNT_DISTRIBUTION_INR`, see the amount-distribution entry above) and
+should be reported, not hidden.
+
+**M8 dashboard spec (`PRD-mandate-recovery-agent.md` sec. "M8 —
+Dashboard", not yet built) is superseded here, per the user, so it isn't
+built the old way:**
+
+The PRD's headline strip spec — "₹ recovered by agent vs baseline, and
+the delta — largest text on the page" — is now WRONG given the finding
+above: a single-run ₹ figure is the least stable number this project
+produces (a ~25% chance of landing under the informal "materialising"
+floor on any given run), while recovery-rate delta is the stable one. Do
+not build M8 against the PRD's literal headline spec. Updated spec:
+
+- **Headline strip (largest text on the page):** the **recovery-rate
+  delta**, in percentage points (agent recovery % vs baseline recovery
+  %), NOT the ₹ figure. This is the number that has held up across 20
+  independently-generated populations (12.0–18.6 points) and is what
+  should anchor the page.
+- **₹ recovered:** still shown, prominently, but as a **range** (min /
+  mean / max across seeds — the exact numbers `metrics/multi_seed.py`
+  already computes), never a single figure presented as THE uplift. A
+  single-run ₹ number is fine to show as "this run's result" alongside
+  the range, but must not stand alone as the page's primary claim.
+- Sections 2-4 (by-bucket comparison chart, governance panel, audit
+  trail table) are unaffected by this change.
+- **Acceptance criterion, updated from the PRD's "Dashboard shows a clear
+  ₹ recovered delta over baseline":** dashboard shows a clear
+  recovery-rate delta over baseline as the headline, AND shows the ₹
+  recovered uplift as a range (not a single figure), both visible without
+  scrolling.
+- **The precomputed-fixture vs. live-sweep-endpoint question is
+  RESOLVED — see the dated entry below ("M8 dashboard: precomputed
+  fixture, not a live sweep endpoint").** Precomputed fixture, not a live
+  endpoint.
+
+## 2026-09-03 — M8 dashboard: precomputed fixture, not a live sweep endpoint
+
+Resolved the open question left in the previous entry (fixture vs. a
+new server-side sweep endpoint), per the user's explicit call and
+reasoning: **precomputed fixture. A 20-seed sweep is too slow to run
+live in a demo, and anything that can hang on stage will.** (Sub-second
+in this session's own timing, yes — but "sub-second on a dev machine
+mid-build" and "reliably fast on the specific laptop and network used
+for a live judged demo" are different claims, and the failure mode of
+guessing wrong on stage — a spinner, a judge's attention drifting — is
+worse than the cost of a slightly-stale precomputed number.)
+
+**Implementation** (`backend/metrics/multi_seed.py`, refactored;
+`backend/metrics/output/multi_seed_range.json`, new, committed):
+
+- `run_sweep(seeds, matrix) -> dict` — pulled out of `main()` — runs
+  `metrics.report.run_comparison` per seed and reduces to summary stats
+  (min/mean/max/stdev uplift, min/mean/max rate delta, below-floor and
+  above-ceiling seed lists) plus small per-seed rows (aggregate numbers
+  only — NOT the full `agent_records`/`baseline_records`, which are
+  `batch_size * 2` per-event dicts per seed and irrelevant to a range
+  summary).
+- `write_fixture(sweep, matrix, out_path)` writes
+  `metrics/output/multi_seed_range.json` — same "committed generated
+  artifact" pattern this project already uses for
+  `generator/output/events_seed42.json` (`generator/__main__.py`), same
+  2-space-indent JSON style. Contains: the sweep summary, every per-seed
+  row, `SEEDS`, the floor/ceiling thresholds, and `engine_version` /
+  `matrix_version` for audit traceability (same two fields every
+  `Decision` record stamps — see M5).
+- **`python -m metrics.multi_seed` now BOTH prints the human-readable
+  report AND writes the fixture** — one command, one source of truth, no
+  separate "generate the fixture" step to forget.
+- **The fixture is explicitly NOT a magic file, per the user's
+  instruction** — its own `_note` field says so in plain language
+  ("Cached snapshot, not a hand-maintained or magic file — regenerate any
+  time with `python -m metrics.multi_seed`"), and `DECISIONS.md` (this
+  entry) says the same. Anyone touching `SEEDS`, the simulation, or the
+  matrix should re-run the command and re-commit the regenerated file —
+  it is fully reproducible (`app/rng.py`'s independent deterministic
+  streams; verified by `test_run_sweep_is_reproducible`), so a stale
+  fixture is a "forgot to regenerate" bug, not a "someone hand-edited a
+  number" risk.
+- 4 new tests (`tests/test_multi_seed.py`, 103 total project-wide):
+  summary-stats arithmetic, reproducibility, floor/ceiling partition
+  correctness, and the fixture's JSON shape.
+
+**M8 dashboard spec, finalized (supersedes both the PRD's original
+headline spec AND the "open question" left in the prior entry):**
+
+- **"Run simulation" button still does ONE live run** (`POST
+  /simulate/run` against a freshly generated batch) — the judge sees the
+  system actually execute, not a static page. This is unchanged from the
+  PRD.
+- **Live run's numbers are displayed** — this run's ₹ recovered, recovery
+  rate, by-bucket breakdown, audit trail — exactly as the PRD's sections
+  2-4 already specify.
+- **The 20-seed range is displayed alongside it, as context, sourced from
+  the committed fixture** — NOT recomputed live, NOT a second live sweep
+  triggered by the button. The dashboard reads
+  `metrics/output/multi_seed_range.json` (bundled at build time or served
+  as a static asset — an M8 build detail, not decided further here) and
+  renders its `rs_uplift_pct` / `recovery_rate_delta_points`
+  min/mean/max alongside the live run's own figures — e.g. "This run:
+  +29.4% ₹ uplift, +14.6pt recovery-rate delta — across 20 seeds:
+  +2.3–68.5% ₹ uplift (mean +24.3%), +12.0–18.6pt recovery-rate delta
+  (mean +15.1pt)."
+- **Headline strip (largest text on the page): recovery-rate delta**,
+  from the LIVE run (not the fixture) — per the prior entry's finding
+  that recovery rate is this project's stable, presentable number. The ₹
+  figure is shown too, but paired with the fixture's range immediately
+  beside/below it, never presented alone as though it were a fixed,
+  precise claim.
+
 ## 2026-09-03 — Tooling
 
 No Python 3.11 installed on this machine. `py -0p` listed a 3.13, but its

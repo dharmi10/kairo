@@ -279,6 +279,7 @@ reason_codes:
     source: gateway
     bucket: B3_TRANSIENT
     action: RETRY
+    delay_hours: 3  # ADDED 2026-09-03 (Phase 5) -- matches gateway_technical_error's delay; missing until caught by the whole-batch window-snapping test
     max_attempts: 2
     snap_to_window: true
     ambiguous: true
@@ -306,6 +307,7 @@ reason_codes:
     source: gateway
     bucket: B3_TRANSIENT
     action: RETRY
+    delay_hours: 3  # ADDED 2026-09-03 (Phase 5) -- see payment_failed's note above
     max_attempts: 2
     snap_to_window: true
     ambiguous: true
@@ -315,6 +317,7 @@ reason_codes:
     source: gateway
     bucket: B3_TRANSIENT
     action: RETRY
+    delay_hours: 3  # ADDED 2026-09-03 (Phase 5) -- see payment_failed's note above
     max_attempts: 2
     snap_to_window: true
     ambiguous: true
@@ -324,6 +327,7 @@ reason_codes:
     source: gateway
     bucket: B3_TRANSIENT
     action: RETRY
+    delay_hours: 3  # ADDED 2026-09-03 (Phase 5) -- see payment_failed's note above
     max_attempts: 2
     snap_to_window: true
     ambiguous: true

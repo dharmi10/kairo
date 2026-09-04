@@ -1,0 +1,262 @@
+{
+  "_generated_by": "python -m metrics.multi_seed",
+  "_note": "Cached snapshot, not a hand-maintained or magic file -- regenerate any time with `python -m metrics.multi_seed` from backend/. Consumed by the M8 dashboard's 20-seed range panel (see DECISIONS.md, 'M8 dashboard: precomputed fixture, not a live sweep endpoint').",
+  "batch_size": 500,
+  "seeds": [
+    42,
+    7,
+    123,
+    2024,
+    55555,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    8,
+    9,
+    10,
+    11,
+    13,
+    15,
+    17,
+    19,
+    21
+  ],
+  "uplift_floor_pct": 10,
+  "uplift_ceiling_pct": 50,
+  "engine_version": "0.1.0",
+  "matrix_version": "2026-09-03",
+  "per_seed": [
+    {
+      "batch_seed": 42,
+      "sim_seed": 42,
+      "agent_rs_recovered": 828296,
+      "baseline_rs_recovered": 640159,
+      "agent_recovery_rate_pct": 54.4,
+      "baseline_recovery_rate_pct": 39.8,
+      "rs_uplift_pct": 29.389104894252835,
+      "recovery_rate_delta_points": 14.600000000000001
+    },
+    {
+      "batch_seed": 7,
+      "sim_seed": 7,
+      "agent_rs_recovered": 845095,
+      "baseline_rs_recovered": 602314,
+      "agent_recovery_rate_pct": 54.6,
+      "baseline_recovery_rate_pct": 37.6,
+      "rs_uplift_pct": 40.308045305272664,
+      "recovery_rate_delta_points": 17.0
+    },
+    {
+      "batch_seed": 123,
+      "sim_seed": 123,
+      "agent_rs_recovered": 996061,
+      "baseline_rs_recovered": 781612,
+      "agent_recovery_rate_pct": 52.8,
+      "baseline_recovery_rate_pct": 38.8,
+      "rs_uplift_pct": 27.436758903394523,
+      "recovery_rate_delta_points": 14.0
+    },
+    {
+      "batch_seed": 2024,
+      "sim_seed": 2024,
+      "agent_rs_recovered": 780333,
+      "baseline_rs_recovered": 762468,
+      "agent_recovery_rate_pct": 55.6,
+      "baseline_recovery_rate_pct": 41.0,
+      "rs_uplift_pct": 2.343049150915186,
+      "recovery_rate_delta_points": 14.600000000000001
+    },
+    {
+      "batch_seed": 55555,
+      "sim_seed": 55555,
+      "agent_rs_recovered": 988532,
+      "baseline_rs_recovered": 745698,
+      "agent_recovery_rate_pct": 56.4,
+      "baseline_recovery_rate_pct": 39.2,
+      "rs_uplift_pct": 32.56465754232947,
+      "recovery_rate_delta_points": 17.199999999999996
+    },
+    {
+      "batch_seed": 1,
+      "sim_seed": 1,
+      "agent_rs_recovered": 999389,
+      "baseline_rs_recovered": 716943,
+      "agent_recovery_rate_pct": 55.6,
+      "baseline_recovery_rate_pct": 39.2,
+      "rs_uplift_pct": 39.39587944927282,
+      "recovery_rate_delta_points": 16.4
+    },
+    {
+      "batch_seed": 2,
+      "sim_seed": 2,
+      "agent_rs_recovered": 831836,
+      "baseline_rs_recovered": 687283,
+      "agent_recovery_rate_pct": 52.6,
+      "baseline_recovery_rate_pct": 39.0,
+      "rs_uplift_pct": 21.032529540233064,
+      "recovery_rate_delta_points": 13.600000000000001
+    },
+    {
+      "batch_seed": 3,
+      "sim_seed": 3,
+      "agent_rs_recovered": 845279,
+      "baseline_rs_recovered": 501623,
+      "agent_recovery_rate_pct": 51.2,
+      "baseline_recovery_rate_pct": 37.0,
+      "rs_uplift_pct": 68.50882036908196,
+      "recovery_rate_delta_points": 14.200000000000003
+    },
+    {
+      "batch_seed": 4,
+      "sim_seed": 4,
+      "agent_rs_recovered": 982785,
+      "baseline_rs_recovered": 918483,
+      "agent_recovery_rate_pct": 52.6,
+      "baseline_recovery_rate_pct": 38.4,
+      "rs_uplift_pct": 7.000891687706795,
+      "recovery_rate_delta_points": 14.200000000000003
+    },
+    {
+      "batch_seed": 5,
+      "sim_seed": 5,
+      "agent_rs_recovered": 995287,
+      "baseline_rs_recovered": 801399,
+      "agent_recovery_rate_pct": 54.2,
+      "baseline_recovery_rate_pct": 37.0,
+      "rs_uplift_pct": 24.193691282369954,
+      "recovery_rate_delta_points": 17.200000000000003
+    },
+    {
+      "batch_seed": 6,
+      "sim_seed": 6,
+      "agent_rs_recovered": 789334,
+      "baseline_rs_recovered": 652102,
+      "agent_recovery_rate_pct": 50.0,
+      "baseline_recovery_rate_pct": 35.0,
+      "rs_uplift_pct": 21.04456051353929,
+      "recovery_rate_delta_points": 15.0
+    },
+    {
+      "batch_seed": 8,
+      "sim_seed": 8,
+      "agent_rs_recovered": 965158,
+      "baseline_rs_recovered": 747561,
+      "agent_recovery_rate_pct": 53.6,
+      "baseline_recovery_rate_pct": 39.2,
+      "rs_uplift_pct": 29.107591219980712,
+      "recovery_rate_delta_points": 14.399999999999999
+    },
+    {
+      "batch_seed": 9,
+      "sim_seed": 9,
+      "agent_rs_recovered": 900010,
+      "baseline_rs_recovered": 748493,
+      "agent_recovery_rate_pct": 54.4,
+      "baseline_recovery_rate_pct": 35.8,
+      "rs_uplift_pct": 20.24294148375469,
+      "recovery_rate_delta_points": 18.6
+    },
+    {
+      "batch_seed": 10,
+      "sim_seed": 10,
+      "agent_rs_recovered": 890781,
+      "baseline_rs_recovered": 820609,
+      "agent_recovery_rate_pct": 55.2,
+      "baseline_recovery_rate_pct": 39.4,
+      "rs_uplift_pct": 8.551210137836655,
+      "recovery_rate_delta_points": 15.800000000000004
+    },
+    {
+      "batch_seed": 11,
+      "sim_seed": 11,
+      "agent_rs_recovered": 1214049,
+      "baseline_rs_recovered": 1002353,
+      "agent_recovery_rate_pct": 60.0,
+      "baseline_recovery_rate_pct": 42.4,
+      "rs_uplift_pct": 21.11990486385535,
+      "recovery_rate_delta_points": 17.6
+    },
+    {
+      "batch_seed": 13,
+      "sim_seed": 13,
+      "agent_rs_recovered": 871517,
+      "baseline_rs_recovered": 740132,
+      "agent_recovery_rate_pct": 53.8,
+      "baseline_recovery_rate_pct": 40.2,
+      "rs_uplift_pct": 17.75156323466625,
+      "recovery_rate_delta_points": 13.599999999999994
+    },
+    {
+      "batch_seed": 15,
+      "sim_seed": 15,
+      "agent_rs_recovered": 879005,
+      "baseline_rs_recovered": 642112,
+      "agent_recovery_rate_pct": 50.8,
+      "baseline_recovery_rate_pct": 36.6,
+      "rs_uplift_pct": 36.892785059304295,
+      "recovery_rate_delta_points": 14.199999999999996
+    },
+    {
+      "batch_seed": 17,
+      "sim_seed": 17,
+      "agent_rs_recovered": 956429,
+      "baseline_rs_recovered": 775545,
+      "agent_recovery_rate_pct": 55.6,
+      "baseline_recovery_rate_pct": 42.6,
+      "rs_uplift_pct": 23.323469302232624,
+      "recovery_rate_delta_points": 13.0
+    },
+    {
+      "batch_seed": 19,
+      "sim_seed": 19,
+      "agent_rs_recovered": 689533,
+      "baseline_rs_recovered": 635251,
+      "agent_recovery_rate_pct": 50.0,
+      "baseline_recovery_rate_pct": 38.0,
+      "rs_uplift_pct": 8.544968839088801,
+      "recovery_rate_delta_points": 12.0
+    },
+    {
+      "batch_seed": 21,
+      "sim_seed": 21,
+      "agent_rs_recovered": 705727,
+      "baseline_rs_recovered": 656303,
+      "agent_recovery_rate_pct": 51.4,
+      "baseline_recovery_rate_pct": 37.4,
+      "rs_uplift_pct": 7.5306679993844305,
+      "recovery_rate_delta_points": 14.0
+    }
+  ],
+  "rs_uplift_pct": {
+    "min": 2.343049150915186,
+    "mean": 24.314154538923617,
+    "max": 68.50882036908196,
+    "stdev": 15.174094094807872
+  },
+  "recovery_rate_delta_points": {
+    "min": 12.0,
+    "mean": 15.06,
+    "max": 18.6
+  },
+  "seeds_below_floor": {
+    "count": 5,
+    "pct": 25.0,
+    "seeds": [
+      2024,
+      4,
+      10,
+      19,
+      21
+    ]
+  },
+  "seeds_above_ceiling": {
+    "count": 1,
+    "pct": 5.0,
+    "seeds": [
+      3
+    ]
+  }
+}
