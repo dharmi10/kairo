@@ -24,11 +24,205 @@ path, not by Claude. That is the honest state of this build, not a
 degraded one: M7's whole design point is that the system's decisions and
 its audit trail are unaffected either way.
 
-## Modelling choices
+## Contents
+
+- [Quickstart (Windows, from a clean clone)](#quickstart-windows-from-a-clean-clone)
+- [Demoing fail-closed live](#demoing-fail-closed-live)
+- [Simulation assumptions — every one, with its reasoning](#simulation-assumptions--every-one-with-its-reasoning)
+- [The API](#the-api)
+- [The explanation layer (M7)](#the-explanation-layer-m7)
+- [The dashboard (`frontend/`)](#the-dashboard-frontend)
+
+---
+
+## Quickstart (Windows, from a clean clone)
+
+Two independent halves that talk over plain HTTP: a Python/FastAPI
+backend and a Vite/React frontend. Start the backend first — the
+frontend has nothing to show until it's up.
+
+### 1. Backend
+
+Tested against **Python 3.10**. (The PRD's tech-stack table names 3.11;
+this machine only had a broken 3.13 install available when the backend
+venv was created — see `DECISIONS.md`, "Tooling" — and nothing here
+depends on a 3.11-only language feature, so 3.10 is the practical
+floor.) PowerShell, from the repo root:
+
+```powershell
+cd backend
+py -3.10 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+copy .env.example .env
+```
+
+`.env`'s defaults work as-is for a local demo (a dummy webhook secret, a
+local SQLite file, no Anthropic key — see "The explanation layer (M7)"
+below for what an absent key means for the demo). Edit it only if you
+have a real Anthropic API key to add, or need to change the webhook
+secret to match something else signing requests at you.
+
+Run the test suite (182 tests, ~20s):
+
+```powershell
+.venv\Scripts\python.exe -m pytest
+```
+
+Start the API — **run this from inside `backend/`** (the default
+`DATABASE_URL` is a relative path):
+
+```powershell
+.venv\Scripts\python.exe -m uvicorn app.main:app --reload
+```
+
+Leave it running. `http://127.0.0.1:8000/health` should return
+`{"status": "ok", ...}`. `Ctrl+C` to stop.
+
+> **Prefer `.venv\Scripts\Activate.ps1` over prefixing every command
+> with `.venv\Scripts\python.exe`?** On a fresh Windows machine,
+> PowerShell's default execution policy blocks running that script —
+> `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` first, or
+> use `.venv\Scripts\activate.bat` from `cmd.exe` instead. Every command
+> in this README uses the `.venv\Scripts\python.exe ...` form
+> specifically so it works regardless of execution policy, with no
+> activation step to troubleshoot.
+
+### 2. Frontend
+
+In a second terminal, with the backend still running:
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173` — you'll land on an empty state ("No
+simulation has run yet"). Tested against Node 22.20.0 / npm 10.9.3;
+anything Node 18+ should work (Vite 5's own floor). `npm install` pulls
+exact pinned versions (`package-lock.json` is committed) — see
+`DECISIONS.md` for why React 18 / Recharts 2 / Vite 5 were pinned over
+the newer majors available at build time.
+
+### 3. Seed a demo run
+
+Either click **Run simulation** in the browser, or — from `backend/`,
+with the API still running — run the demo script, which does the same
+thing plus one more:
+
+```powershell
+.venv\Scripts\python.exe -m demo.seed
+```
+
+This runs the canonical, reproducible 500-event comparison (seed 42,
+`POST /simulate/run`'s own defaults) **and** injects one hand-crafted
+event carrying a reason code that isn't in `config/decision_matrix.yaml`
+— see the next section. Reload the dashboard afterwards to see both.
+
+### 4. Resetting between runs
+
+Click **Run simulation** again (it clears the DB and reruns), or:
+
+```powershell
+curl -X POST http://127.0.0.1:8000/reset
+```
+
+`python -m demo.seed` is also safe to re-run any number of times — same
+reproducible batch, and the injected event's fixed `event_id` means a
+second run just hits the documented idempotency path instead of piling
+up demo litter.
+
+---
+
+## Demoing fail-closed live
+
+architecture-and-security.md sec. 5.1 names this as a 30-second demo
+moment worth actually showing, not just claiming: *"Feed the system a
+reason code that isn't in the YAML and show it safely routing to human
+review instead of guessing."* `python -m demo.seed` (see above) does
+exactly this — after the canonical batch run, it POSTs one more event
+through the real webhook endpoint, HMAC-signed like any other, with
+`error.reason` set to `npci_traffic_shaping_declined` — a plausible name
+for a code Razorpay/NPCI could plausibly ship next (this project's own
+premise is about NPCI's traffic-management framework — PRD sec. 1), and
+checked at test time (`tests/test_demo_seed.py`) to guarantee it never
+collides with a real entry in the matrix.
+
+**What to show:** in the dashboard's audit trail, search
+`evt_demo_unknown_reason_code` (or filter Bucket = `B_UNKNOWN`). The
+row shows:
+
+| Field | Value | What it proves |
+|---|---|---|
+| `classified_bucket` | `B_UNKNOWN` | The classifier never guessed a bucket for a code it doesn't recognise |
+| `confidence` | `0.0` | Zero, not a hedged guess — this is the "we have no information" case, distinct from "we're not confident enough" (see `classifier/classify.py`) |
+| `policy_verdict` | `ESCALATE` | The policy engine's data-quality gate (rule 1) fires before any bucket-based rule is even trusted |
+| `action` | `HUMAN_QUEUE` | Routed to a person, not auto-retried |
+| `scheduled_for` | `null` | No money-moving action was scheduled |
+
+The same thing, straight from the API, if you'd rather show a terminal
+than a browser:
+
+```powershell
+curl http://127.0.0.1:8000/audit?q=evt_demo_unknown_reason_code
+```
+
+This is P3 (fail closed — architecture-and-security.md sec. 1) made
+concrete: an unrecognised reason code is the one input this system is
+guaranteed not to act on autonomously, and the demo script proves it
+against the real HTTP endpoint every time it runs
+(`demo/seed.py` exits non-zero if the injected event's outcome ever
+stops matching this table).
+
+---
+
+## Simulation assumptions — every one, with its reasoning
+
+Everything below is a **documented assumption**, not a measurement,
+per the project's honesty requirements (PRD sec. 11). If a number in
+this section isn't backed by a cited source, treat it as a modelling
+choice made for defensibility and internal consistency, not as a claim
+about the real world. `config/decision_matrix.yaml` and `DECISIONS.md`
+carry the same distinction for the reason-code matrix and the full
+build history respectively.
+
+### Timestamp distribution: 35% of debits fall in the NPCI restricted window
+
+`generator/generate.py::_sample_failed_at` draws each event's failure
+hour from a per-event coin flip: with probability `RESTRICTED_WINDOW_SHARE
+= 0.35`, the hour is uniform within `10:00–13:00`; otherwise it's uniform
+over every other hour. PRD sec. M2, verbatim: *"35% of original debits
+fall inside the 10AM–1PM restricted window (this is what makes the
+congestion USP measurable)."* Not derived from any real Razorpay traffic
+data — Razorpay doesn't publish an hour-of-day distribution — chosen
+specifically to make B1_CONGESTION a large enough slice of the batch
+(65/500 ≈ 13% on seed 42, after the classifier's own false-positive/
+false-negative noise) that the congestion story is demonstrable without
+dominating every other bucket.
+
+### NPCI window timings — independently checked, not just assumed
+
+PRD sec. 11.3 requires verifying the NPCI restricted-window timing is
+still current as of the demo date, not carried over unchecked from
+whenever the PRD was written. Checked via web search during this build
+(2026-09-04, one day before the PRD's stated deadline): NPCI's traffic
+management rules for UPI AutoPay, which took effect **May 2026**,
+restrict automated recurring-mandate execution during **10:00–13:00
+IST**, directing banks to schedule background debits before 10:00,
+between 13:00–17:00, or after 21:30 instead — corroborated independently
+of Razorpay's own docs (Republic World, *"UPI AutoPay Failure: Why Your
+Morning EMIs and SIPs are Failing in May 2026"*,
+<https://www.republicworld.com/business/upi-autopay-failure-morning-peak-hours-npci-new-rules-2026>).
+This matches `app/config.py`'s `npci_restricted_start_hour=10` /
+`npci_restricted_end_hour=13` exactly — no code change was needed, but
+the check itself hadn't been done until now, and "we didn't check" is a
+different, weaker claim than "we checked and it's still right." A
+single web search is not the same rigour as reading NPCI's own circular
+directly; treat this as corroborated, not primary-source-verified.
 
 ### The ground-truth oracle is conditional, not independent-per-attempt
 
-The synthetic generator's oracle (`generator/`, not yet built) computes
+The synthetic generator's oracle (`generator/oracle.py`) computes
 retry-success probability as a function of the **context at the specific
 retry datetime** — never as a fixed per-reason probability drawn
 independently at each attempt.
@@ -384,19 +578,31 @@ clearer, not smaller, going from n=5 to n=20.
 ### Reason codes
 
 `backend/config/decision_matrix.yaml` cites its own sources inline —
-`VERIFIED` entries link to the Razorpay docs page they came from,
-`PLACEHOLDER` entries are explicitly marked as unconfirmed synthetic
-assumptions for the UPI-mandate-lifecycle events Razorpay doesn't publicly
-document a reason-code string for. See `DECISIONS.md` for the full
+`VERIFIED` entries link to the Razorpay docs page they came from (37 of
+40 reason codes); `PLACEHOLDER` entries are explicitly marked as
+unconfirmed synthetic assumptions for the UPI-mandate-lifecycle events
+Razorpay doesn't publicly document a reason-code string for. Per PRD
+sec. 11.2's honesty requirement, named explicitly here rather than left
+to a grep of the YAML: the three PLACEHOLDER codes are
+**`mandate_revoked_by_customer`**, **`mandate_expired`**, and
+**`mandate_amount_exceeded`** — all three are UPI-mandate-lifecycle
+events (revocation, expiry, amount-limit breach), not payment-gateway
+failures, which is exactly the category Razorpay's public API/webhook
+docs don't name a reason string for. Their bucket/play assignments
+(B5_DEAD / B5_DEAD / ESCALATE_HUMAN respectively) are this project's own
+defensible-by-construction judgement calls, not confirmed Razorpay
+behaviour — correct the strings against Razorpay's docs before citing
+them as real in a pitch. See `DECISIONS.md` for the full two-pass
 verification history.
 
 ## The API
 
-Seven endpoints (`backend/app/api.py`). Run the server with:
+Seven endpoints (`backend/app/api.py`). See "Quickstart" above for the
+full setup; once the venv exists, run the server with:
 
-```
+```powershell
 cd backend
-uvicorn app.main:app --reload
+.venv\Scripts\python.exe -m uvicorn app.main:app --reload
 ```
 
 | Method | Path | Purpose |

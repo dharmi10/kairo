@@ -1605,3 +1605,192 @@ Also noted, not fixed: the production JS bundle is 531KB (154KB
 gzipped), past Vite's 500KB warning threshold — mostly Recharts. Not
 worth code-splitting for a single-page buildathon demo; flagged rather
 than silently ignored.
+
+## 2026-09-04 — Final phase: DoD review, README rewrite, demo script, and a retrospective on what broke
+
+No new features this pass — closing verification gaps, documenting
+properly, and reviewing the build history with the user while it's
+fresh, per their explicit request.
+
+### Retrospective: what actually broke during this build, and what we did about it
+
+Compiled here as one index, not a re-telling — every item below links
+back to its own full entry above. Six real, load-bearing bugs across the
+build, each caught before being presented as a result, none caught by
+code review alone:
+
+1. **The 54% escalation collision** (see "Fixed the 54% escalation
+   collision" above). Uniform amount bands + a Rs.5,000 threshold sent
+   54% of the batch to ESCALATE, silently gutting the "autonomous agent"
+   premise. Root cause was the AMOUNT DISTRIBUTION, not the threshold —
+   the two are not independent parameters, and this project treats them
+   as one decision going forward. Fixed by switching to log-normal
+   per-category sampling + raising the threshold to Rs.10,000, chosen
+   together and cross-checked against RBI's AFA threshold.
+
+2. **Independent-draw compounding under a "conditional" oracle**
+   ("Phase 6 ... two real bugs", Bug 1). The oracle was redesigned to be
+   conditional on context specifically to stop probability from
+   artificially escalating with attempt count — then the simulation
+   itself reintroduced the same artifact one layer up, drawing
+   independently every time baseline retried under the SAME restricted-
+   window context three days running. First symptom: agent lost to
+   baseline by -49.4%, which is what made this visible at all. Fixed
+   with a per-`(event, context-key)` outcome cache shared between both
+   arms.
+
+3. **Cooling-off self-collision silently capping every mandate at 1
+   retry** (same entry, Bug 2). Advancing the simulated clock to
+   *exactly* the last attempt's own firing time made the next cooling-off
+   check compare an attempt against itself — a permanent 0h gap,
+   regardless of the bucket's real delay. No error, no test failure,
+   just a systematically wrong number for the entire batch. Found by
+   manually diffing mismatched outcomes between arms, not by any
+   automated check; a dedicated regression test exists now.
+
+4. **A metric that gave zero credit for a correct decision**
+   ("Nudge acceptance wired into $-recovery"). Every `NUDGE_SENT` action
+   scored Rs.0 in $-recovered from Phase 2 onward, landing hardest on
+   B5_DEAD (nudge-only by construction) and making B4_STRUCTURAL read as
+   "0% recovery" in a way that looked like a modelling gap in the AGENT
+   rather than a hole in the METRIC. Wiring it in moved the honest
+   uplift from -17.4% to +29.3% on that session's RNG state — a case
+   where "the number got much better" was the correct, not the
+   convenient, outcome, because the fix closed a real scoring gap rather
+   than tuning anything.
+
+5. **A shared sequential RNG made "the baseline recovers Rs.X" an
+   unstable fact** ("Independent deterministic RNG streams"). Wiring
+   nudge acceptance (an AGENT-side change) shifted baseline's OWN
+   Rs-recovered figure, because both arms drew from one seeded stream
+   consumed in order. Fixed with `app/rng.py`'s per-draw independent
+   streams — and the fix itself moved the headline number again
+   (+29.3% → +60.1% on the same nominal seed), which is the correct,
+   documented consequence of retiring an architecture that was never
+   sound, not a new discrepancy to chase.
+
+6. **The Razorpay-envelope UTC/IST timestamp bug** (Phase 7.5,
+   "Razorpay envelope adapter"). `created_at` is Unix epoch UTC; every
+   other timestamp in this codebase is naive-and-implicitly-IST. A
+   naive-UTC conversion would have silently shifted every NPCI-window
+   decision by 5.5 hours for any event arriving via the real webhook
+   shape. Caught by a flat-vs-envelope parity test asserting identical
+   buckets for the identical wall-clock instant — not by inspection.
+
+Two more, smaller, found by actually **running** the thing rather than
+by tests or types:
+
+7. **`MandateState` counters were `None`, not `0`, before first flush**
+   (Phase 7). SQLAlchemy column `default=` applies at INSERT; the policy
+   engine reads the in-memory object before that. `None >= 3` is a
+   `TypeError`, hit on the very first end-to-end webhook call against a
+   fresh mandate. Fixed by setting every counter explicitly at
+   construction.
+
+8. **The audit table's last column was labelled "Decided" and showed
+   `scheduled_for`** (Phase 8). Invisible in source, obvious on screen —
+   found only because the dashboard was actually driven through a real
+   Chrome instance rather than trusted on `npm run build` succeeding.
+   The general lesson, not just this one fix: **"the build passed" and
+   "the app was run" are different claims**, and this build's one
+   visible-only bug is evidence for taking that distinction seriously
+   going forward, not just here.
+
+**The pattern across all eight:** every one was invisible to the layer
+of checking available at the time it shipped (code review, types, a
+build) and visible only to a layer added specifically to catch it (a
+whole-batch invariant test, a cross-arm consistency test, an actual
+browser). None were caught by "looking hard at the code" — several
+(Bug 2, the RNG issue) are the kind of off-by-nothing error that reads
+as correct on inspection and is only wrong in aggregate, over hundreds
+of draws, comparing two arms against each other.
+
+### Gaps found and closed this pass
+
+- **The PRD's own Definition-of-Done item — "`POST /simulate/run`
+  processes 500 events end to end without error" — had never been
+  regression-tested AT 500 events, THROUGH the API.** Every API test
+  used `count=60` for speed; the only n=500 evidence was
+  `python -m executor.pipeline` (in-process, bypasses the DB, the HTTP
+  layer, and the explanation guard entirely) and this session's own
+  manual `curl`/browser runs. Closed:
+  `test_simulate_run_processes_500_events_through_the_api_without_error`
+  (`tests/test_api.py`) — 500 events through the real endpoint, plus a
+  re-check of the window-snapping and hard-decline invariants at that
+  exact scale, since a bug that only shows up under load is exactly what
+  a smaller n could hide.
+- **PRD sec. 11.3's honesty requirement ("verify the NPCI window timings
+  are still current as of the demo date") had never actually been
+  checked** — the 10:00–13:00 window was carried as a PRD-given input,
+  not independently verified. Checked via web search this session:
+  NPCI's traffic-management rules for UPI AutoPay (effective May 2026)
+  do restrict automated recurring-mandate execution during 10:00–13:00
+  IST, corroborated by a source independent of Razorpay's own docs
+  (Republic World; full citation in the README). Matches
+  `app/config.py` exactly — no code change needed, but "we checked and
+  it's still right" is a materially different, stronger claim than
+  what the README said before this pass, which was nothing.
+- **No demo path exercised the fail-closed / unknown-reason-code
+  behaviour against a live backend.** `architecture-and-security.md`
+  sec. 5.1 names this as a 30-second demo moment worth actually
+  building, not just describing — closed with `backend/demo/seed.py`
+  (`python -m demo.seed`): runs the canonical reproducible batch, then
+  POSTs one hand-crafted, HMAC-signed event carrying
+  `npci_traffic_shaping_declined` (checked at test time,
+  `tests/test_demo_seed.py`, to never collide with a real matrix entry)
+  through the real webhook endpoint, and asserts — exits non-zero if
+  not — that it lands exactly on B_UNKNOWN / ESCALATE / HUMAN_QUEUE /
+  no schedule.
+- **The README had no "how to run this from a clean clone" section at
+  all** — no venv creation, no `pip install`, no `.env` setup, no
+  Windows-specific activation guidance, despite the project living on a
+  Windows machine throughout. Closed with a full Quickstart (backend
+  venv + tests + server, frontend install + dev server, demo seeding,
+  reset) using the `.venv\Scripts\python.exe -m ...` invocation style
+  this entire session's own tool use already proved reliable, with an
+  explicit note on the PowerShell execution-policy trap
+  `Activate.ps1` runs into on a fresh machine.
+- **Two stale leftovers, found while reading the README end to end for
+  this pass:** "the ground-truth oracle (`generator/`, not yet built)"
+  — a Phase-1-era sentence never updated after Phase 2 shipped it — and
+  `frontend/.env.example` pointing at a `backend/README` that has never
+  existed (the docs are one root-level `README.md`). Both fixed.
+- **The `Reason codes` README section pointed at `DECISIONS.md` instead
+  of naming the three unverified codes directly** — closed per PRD
+  sec. 11.2: `mandate_revoked_by_customer`, `mandate_expired`, and
+  `mandate_amount_exceeded` are now named explicitly in the README
+  itself as the ones to re-verify against Razorpay's docs before
+  presenting them as confirmed.
+
+### Gaps identified and deliberately left open
+
+Stated plainly rather than allowed to look resolved by omission:
+
+- **The Razorpay webhook envelope adapter has never parsed an ACTUAL
+  captured Razorpay payload** — only payloads this project constructed
+  itself from public documentation (two of the specific doc URLs
+  fetched during that work 404'd; the wrapper shape is VERIFIED-by-
+  convention, not VERIFIED-by-example — see the Phase 7.5 entry). If a
+  real Razorpay sandbox account becomes available before the pitch, the
+  single highest-value thing left to do is feed the adapter one real
+  captured webhook body and confirm it parses.
+- **B4_STRUCTURAL's flat oracle probability (`p=0.20`) is, by this
+  project's own earlier admission, "the least-scrutinized number in
+  `ORACLE_PROBABILITIES`"** — carried over unchanged from the PRD's
+  original spec with no bucket-specific reasoning ever recorded. Every
+  other oracle branch has at least a stated intuition (balance timing
+  correlates with payday, congestion correlates with the restricted
+  window); B4's does not. Not fixed — flagged again here so it doesn't
+  quietly stop being a known soft spot.
+- **No concurrent-request test exists for idempotency layer 2**
+  (the `UNIQUE (mandate_id, cycle_id, retry_attempt_number)` constraint
+  on `attempts`). Layer 1 (event_id dedupe) is tested; the DB-level
+  constraint that's supposed to hold even if layer 1 is somehow bypassed
+  has never been exercised under actual concurrent access — SQLite plus
+  FastAPI's synchronous per-request session likely serializes this away
+  in practice, but "likely" is doing real work in that sentence, and
+  nothing in this test suite proves it either way.
+- **Replay protection and per-merchant rate limiting remain [DESIGN]
+  only**, per architecture-and-security.md sec. 3.5 — unchanged from
+  every earlier phase's own statement of this, restated here for
+  completeness rather than re-decided.

@@ -520,6 +520,45 @@ def test_simulate_run_is_reproducible(client):
     assert first["baseline"] == second["baseline"]
 
 
+def test_simulate_run_processes_500_events_through_the_api_without_error(client):
+    """PRD sec. 10, Definition of Done, literally: 'POST /simulate/run
+    processes 500 events end to end without error.' The other tests in
+    this file all use count=60 for speed -- this is the one that actually
+    exercises the DoD's own number, through the real endpoint (not
+    metrics.report's in-process call, which never touches the DB, the
+    HTTP layer, or the explanation guard). Also re-checks the two
+    batch-wide safety invariants at that exact scale, since a bug that
+    only shows up under load (a window-snapping edge case, an attempt-cap
+    off-by-one) is exactly the kind of thing a smaller n could hide."""
+    response = client.post("/simulate/run", json={"count": 500, "batch_seed": 42, "sim_seed": 20260903})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["decisions_written"] > 500  # a recovery cycle can take several decisions
+    assert body["agent"]["n"] == 500
+    assert body["explanations"]["llm"] + body["explanations"]["template"] == body["decisions_written"]
+
+    db = SessionLocal()
+    try:
+        assert db.query(Event).count() == 500
+        assert db.query(Decision).filter(Decision.explanation.is_(None)).count() == 0
+
+        scheduled = [a.scheduled_for for a in db.query(Attempt).all()]
+        assert scheduled  # the batch does schedule at least some retries
+        assert not [
+            t for t in scheduled
+            if settings.npci_restricted_start_hour <= t.hour < settings.npci_restricted_end_hour
+        ]
+
+        hard_decline_attempts = (
+            db.query(Decision)
+            .filter(Decision.classified_bucket == "B5_DEAD", Decision.action == "RETRY_SCHEDULED")
+            .count()
+        )
+        assert hard_decline_attempts == 0
+    finally:
+        db.close()
+
+
 def test_simulate_run_explains_every_decision_without_exhausting_the_api(run, client):
     """PRD M7: cache by (bucket, action, policy_verdict), do not make one
     call per decision. With no key configured every explanation is a
